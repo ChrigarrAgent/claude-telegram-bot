@@ -1,0 +1,20 @@
+[Unit]
+Description=Claude Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Projects/claude-telegram-bot
+Environment=PATH=/home/ubuntu/.bun/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/ubuntu/Projects/claude-telegram-bot/.env
+ExecStart=/home/ubuntu/.bun/bin/bun /home/ubuntu/Projects/claude-telegram-bot/src/index.ts
+Restart=always
+RestartSec=10
+
+# Logging - use journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

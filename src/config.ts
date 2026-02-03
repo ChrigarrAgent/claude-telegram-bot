@@ -42,8 +42,26 @@ export const ALLOWED_USERS: number[] = (
   .map((x) => parseInt(x.trim(), 10))
   .filter((x) => !isNaN(x));
 
-export const WORKING_DIR = process.env.CLAUDE_WORKING_DIR || HOME;
+// Working directory - mutable for project switching
+let _workingDir = process.env.CLAUDE_WORKING_DIR || HOME;
+export const getWorkingDir = () => _workingDir;
+export const setWorkingDir = (dir: string) => { _workingDir = dir; };
+export const WORKING_DIR = process.env.CLAUDE_WORKING_DIR || HOME; // Initial value
+
+// Project aliases for quick switching
+export const PROJECT_ALIASES: Record<string, string> = {
+  "home": HOME,
+  "aegir": "/home/ubuntu/.openclaw/workspace/aegir",
+  "openclaw": "/home/ubuntu/.openclaw/workspace",
+  "projects": "/home/ubuntu/Projects",
+  "telegram-bot": "/home/ubuntu/Projects/claude-telegram-bot",
+};
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+export const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+
+// Transcription provider: prefer Groq (fast & cheap), fallback to OpenAI
+export const TRANSCRIPTION_PROVIDER: "groq" | "openai" | "none" =
+  GROQ_API_KEY ? "groq" : OPENAI_API_KEY ? "openai" : "none";
 
 // ============== Claude CLI Path ==============
 
@@ -170,7 +188,7 @@ export const TRANSCRIPTION_PROMPT = TRANSCRIPTION_CONTEXT
   ? `${BASE_TRANSCRIPTION_PROMPT}\n\nAdditional context:\n${TRANSCRIPTION_CONTEXT}`
   : BASE_TRANSCRIPTION_PROMPT;
 
-export const TRANSCRIPTION_AVAILABLE = !!OPENAI_API_KEY;
+export const TRANSCRIPTION_AVAILABLE = TRANSCRIPTION_PROVIDER !== "none";
 
 // ============== Thinking Keywords ==============
 

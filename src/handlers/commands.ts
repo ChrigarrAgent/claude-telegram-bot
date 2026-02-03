@@ -6,7 +6,7 @@
 
 import type { Context } from "grammy";
 import { session } from "../session";
-import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "../config";
+import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, PROJECT_ALIASES, getWorkingDir, setWorkingDir } from "../config";
 import { isAuthorized } from "../security";
 
 /**
@@ -34,11 +34,15 @@ export async function handleStart(ctx: Context): Promise<void> {
       `/status - Show detailed status\n` +
       `/resume - Resume last session\n` +
       `/retry - Retry last message\n` +
+      `/project - Switch project/directory\n` +
+      `/handoff - Get SSH takeover command\n` +
+      `/tmux - Shared tmux session info\n` +
       `/restart - Restart the bot\n\n` +
       `<b>Tips:</b>\n` +
       `• Prefix with <code>!</code> to interrupt current query\n` +
       `• Use "think" keyword for extended reasoning\n` +
-      `• Send photos, voice, or documents`,
+      `• Send photos, voice, or documents\n` +
+      `• Use /handoff to continue in SSH`,
     { parse_mode: "HTML" }
   );
 }
@@ -160,7 +164,7 @@ export async function handleStatus(ctx: Context): Promise<void> {
   }
 
   // Working directory
-  lines.push(`\n📁 Working dir: <code>${WORKING_DIR}</code>`);
+  lines.push(`\n📁 Working dir: <code>${getWorkingDir()}</code>`);
 
   await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
 }
@@ -257,6 +261,148 @@ export async function handleRestart(ctx: Context): Promise<void> {
 
   // Exit - launchd will restart us
   process.exit(0);
+}
+
+/**
+ * /handoff - Show session ID and SSH takeover instructions.
+ */
+export async function handleHandoff(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  if (!session.isActive) {
+    await ctx.reply(
+      "❌ No active session.\n\n" +
+        "Start a conversation first, then use /handoff to take over in SSH."
+    );
+    return;
+  }
+
+  const sessionId = session.sessionId!;
+  const shortId = sessionId.slice(0, 8);
+
+  // Create a simple command the user can run after SSH
+  await ctx.reply(
+    `🔄 <b>SSH Handoff</b>\n\n` +
+      `<b>1. SSH to your server, then run:</b>\n` +
+      `<code>cr</code>\n\n` +
+      `That's it! The <code>cr</code> (claude-resume) command auto-detects and resumes this session.\n\n` +
+      `<b>Session ID (if needed):</b>\n` +
+      `<code>${sessionId}</code>`,
+    { parse_mode: "HTML" }
+  );
+}
+
+/**
+ * /tmux - Start/attach to a shared tmux session for Claude.
+ */
+export async function handleTmux(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const tmuxSession = "claude-shared";
+  const sessionArg = session.isActive ? ` --resume ${session.sessionId}` : "";
+
+  await ctx.reply(
+    `🖥️ <b>tmux Session</b>\n\n` +
+      `<b>Attach to shared session:</b>\n` +
+      `<code>tmux attach -t ${tmuxSession} || tmux new -s ${tmuxSession} "claude${sessionArg}"</code>\n\n` +
+      `<b>Send command from Telegram:</b>\n` +
+      `<code>tmux send-keys -t ${tmuxSession} "your message" Enter</code>\n\n` +
+      `<b>Current state:</b>\n` +
+      `• Telegram session: ${session.isActive ? "Active" : "None"}\n` +
+      `• Working dir: <code>${WORKING_DIR}</code>`,
+    { parse_mode: "HTML" }
+  );
+}
+
+/**
+ * /project - Switch working directory or list projects.
+ */
+export async function handleProject(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const text = ctx.message?.text || "";
+  const args = text.split(/\s+/).slice(1); // Remove /project
+
+  // No args - show current project and list
+  if (args.length === 0) {
+    const currentDir = getWorkingDir();
+    const projectList = Object.entries(PROJECT_ALIASES)
+      .map(([name, path]) => `  <code>/project ${name}</code> → ${path}`)
+      .join("\n");
+
+    await ctx.reply(
+      `📁 <b>Current Project</b>\n` +
+        `<code>${currentDir}</code>\n\n` +
+        `<b>Available Projects:</b>\n${projectList}\n\n` +
+        `<b>Or specify a path:</b>\n` +
+        `<code>/project /path/to/dir</code>`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const target = args[0]!;
+  let newDir: string;
+
+  // Check if it's an alias
+  if (PROJECT_ALIASES[target]) {
+    newDir = PROJECT_ALIASES[target]!;
+  } else if (target.startsWith("/") || target.startsWith("~")) {
+    // It's a path
+    newDir = target.replace(/^~/, process.env.HOME || "/home/ubuntu");
+  } else {
+    // Try as a project name in common locations
+    const candidates = [
+      `/home/ubuntu/Projects/${target}`,
+      `/home/ubuntu/.openclaw/workspace/${target}`,
+      `/home/ubuntu/${target}`,
+    ];
+    const found = candidates.find((p) => Bun.file(p).size !== undefined);
+    if (!found) {
+      await ctx.reply(
+        `❌ Project "${target}" not found.\n\n` +
+          `Tried:\n${candidates.map((c) => `  • ${c}`).join("\n")}\n\n` +
+          `Use <code>/project</code> to see available aliases.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    newDir = found;
+  }
+
+  // Verify directory exists
+  const stat = await Bun.file(newDir).exists().catch(() => false);
+  if (!stat) {
+    await ctx.reply(`❌ Directory not found: <code>${newDir}</code>`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Switch directory and start new session
+  setWorkingDir(newDir);
+  await session.kill(); // Clear old session for new project
+
+  await ctx.reply(
+    `✅ <b>Switched to:</b> <code>${newDir}</code>\n\n` +
+      `Session cleared. Next message starts fresh in this project.`,
+    { parse_mode: "HTML" }
+  );
 }
 
 /**

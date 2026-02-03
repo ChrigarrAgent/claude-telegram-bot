@@ -24,6 +24,7 @@ export interface SavedSession {
   saved_at: string;
   working_dir: string;
   title: string; // First message truncated (max ~50 chars)
+  project?: string; // Project name for easy identification
 }
 
 export interface SessionHistory {
