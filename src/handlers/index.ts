@@ -10,6 +10,9 @@ export {
   handleResume,
   handleRestart,
   handleRetry,
+  handleHandoff,
+  handleTmux,
+  handleProject,
 } from "./commands";
 export { handleText } from "./text";
 export { handleVoice } from "./voice";

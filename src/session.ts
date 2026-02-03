@@ -22,6 +22,7 @@ import {
   THINKING_DEEP_KEYWORDS,
   THINKING_KEYWORDS,
   WORKING_DIR,
+  getWorkingDir,
 } from "./config";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
@@ -208,7 +209,7 @@ class ClaudeSession {
     // Build SDK V1 options - supports all features
     const options: Options = {
       model: "claude-sonnet-4-5",
-      cwd: WORKING_DIR,
+      cwd: getWorkingDir(),
       settingSources: ["user", "project"],
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -487,12 +488,15 @@ class ClaudeSession {
       // Load existing session history
       const history = this.loadSessionHistory();
 
-      // Create new session entry
+      // Create new session entry with project name
+      const workDir = getWorkingDir();
+      const projectName = workDir.split("/").pop() || "home";
       const newSession: SavedSession = {
         session_id: this.sessionId,
         saved_at: new Date().toISOString(),
-        working_dir: WORKING_DIR,
-        title: this.conversationTitle || "Sessione senza titolo",
+        working_dir: workDir,
+        title: this.conversationTitle || `${projectName} session`,
+        project: projectName,
       };
 
       // Remove any existing entry with same session_id (update in place)

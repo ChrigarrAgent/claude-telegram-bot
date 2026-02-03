@@ -16,6 +16,9 @@ import {
   handleResume,
   handleRestart,
   handleRetry,
+  handleHandoff,
+  handleTmux,
+  handleProject,
   handleText,
   handleVoice,
   handlePhoto,
@@ -56,6 +59,9 @@ bot.command("status", handleStatus);
 bot.command("resume", handleResume);
 bot.command("restart", handleRestart);
 bot.command("retry", handleRetry);
+bot.command("handoff", handleHandoff);
+bot.command("tmux", handleTmux);
+bot.command("project", handleProject);
 
 // ============== Message Handlers ==============
 

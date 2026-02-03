@@ -12,15 +12,32 @@ import {
   AUDIT_LOG_PATH,
   AUDIT_LOG_JSON,
   OPENAI_API_KEY,
+  GROQ_API_KEY,
   TRANSCRIPTION_PROMPT,
   TRANSCRIPTION_AVAILABLE,
+  TRANSCRIPTION_PROVIDER,
 } from "./config";
 
-// ============== OpenAI Client ==============
+// ============== Transcription Client ==============
 
-let openaiClient: OpenAI | null = null;
-if (OPENAI_API_KEY && TRANSCRIPTION_AVAILABLE) {
-  openaiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
+let transcriptionClient: OpenAI | null = null;
+let transcriptionModel = "whisper-1";
+
+if (TRANSCRIPTION_PROVIDER === "groq" && GROQ_API_KEY) {
+  // Groq Whisper - fast & cheap
+  transcriptionClient = new OpenAI({
+    apiKey: GROQ_API_KEY,
+    baseURL: "https://api.groq.com/openai/v1",
+  });
+  transcriptionModel = "whisper-large-v3-turbo";
+  console.log("Voice transcription: Groq Whisper (fast)");
+} else if (TRANSCRIPTION_PROVIDER === "openai" && OPENAI_API_KEY) {
+  // OpenAI Whisper
+  transcriptionClient = new OpenAI({ apiKey: OPENAI_API_KEY });
+  transcriptionModel = "whisper-1";
+  console.log("Voice transcription: OpenAI Whisper");
+} else {
+  console.log("Voice transcription: Not configured");
 }
 
 // ============== Audit Logging ==============
@@ -150,15 +167,15 @@ export async function auditLogRateLimit(
 export async function transcribeVoice(
   filePath: string
 ): Promise<string | null> {
-  if (!openaiClient) {
-    console.warn("OpenAI client not available for transcription");
+  if (!transcriptionClient) {
+    console.warn("Transcription client not available");
     return null;
   }
 
   try {
     const file = Bun.file(filePath);
-    const transcript = await openaiClient.audio.transcriptions.create({
-      model: "gpt-4o-transcribe",
+    const transcript = await transcriptionClient.audio.transcriptions.create({
+      model: transcriptionModel,
       file: file,
       prompt: TRANSCRIPTION_PROMPT,
     });
