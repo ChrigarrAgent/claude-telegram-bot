@@ -13,6 +13,7 @@ import { isAuthorized } from "../security";
 import { auditLog, startTypingIndicator } from "../utils";
 import { StreamingState, createStatusCallback } from "./streaming";
 import { updateSafetyRequest } from "./safety-confirmation";
+import { getProjectByAlias, getProjectAlias } from "../project-aliases";
 
 /**
  * Handle callback queries from inline keyboards.
@@ -115,10 +116,14 @@ export async function handleCallback(ctx: Context): Promise<void> {
   // 8. Send the choice to Claude as a message
   const message = selectedOption;
 
+  // Get the project session for this chat
+  const projectName = sessionManager.getLastUsed(chatId) || "default";
+  const projectSession = await sessionManager.getOrCreateSession(projectName);
+
   // Interrupt any running query - button responses are always immediate
-  if (session.isRunning) {
+  if (projectSession.isRunning()) {
     console.log("Interrupting current query for button response");
-    await session.stop();
+    await projectSession.session.stop();
     // Small delay to ensure clean interruption
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -131,7 +136,7 @@ export async function handleCallback(ctx: Context): Promise<void> {
   const statusCallback = createStatusCallback(ctx, state);
 
   try {
-    const response = await session.sendMessageStreaming(
+    const response = await projectSession.sendMessage(
       message,
       username,
       userId,
@@ -154,7 +159,7 @@ export async function handleCallback(ctx: Context): Promise<void> {
 
     if (String(error).includes("abort") || String(error).includes("cancel")) {
       // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
-      const wasInterrupt = session.consumeInterruptFlag();
+      const wasInterrupt = projectSession.session.consumeInterruptFlag();
       if (!wasInterrupt) {
         await ctx.reply("🛑 Query stopped.");
       }
@@ -237,15 +242,13 @@ async function handleResumeCallback(
     return;
   }
 
-  // Switch project if needed
-  const currentProject = sessionManager.getCurrentProject();
-  if (projectName !== currentProject) {
-    const projectPath = resolveProjectPath(projectName);
-    setWorkingDir(projectPath);
-    sessionManager.setCurrentProject(projectName);
-    if (chatId) {
-      sessionManager.setLastUsed(chatId, projectName);
-    }
+  // ALWAYS switch to the project's working directory when resuming
+  // This ensures messages are routed to the correct folder
+  const projectPath = resolveProjectPath(projectName);
+  setWorkingDir(projectPath);
+  sessionManager.setCurrentProject(projectName);
+  if (chatId) {
+    sessionManager.setLastUsed(chatId, projectName);
   }
 
   // Resume the selected session
@@ -290,15 +293,16 @@ async function handleResumeCallback(
 }
 
 /**
- * Handle project callbacks: project:create|clone|cancel:{name}
+ * Handle project callbacks: project:switch|create|clone|cancel:{name}
  */
 async function handleProjectCallback(
   ctx: Context,
   callbackData: string
 ): Promise<void> {
+  const chatId = ctx.chat?.id;
   const parts = callbackData.split(":");
-  const action = parts[1]; // create, clone, or cancel
-  const projectName = parts[2]; // project name (may be empty for cancel)
+  const action = parts[1]; // switch, create, clone, or cancel
+  const projectName = parts[2]; // project name or alias
 
   if (action === "cancel") {
     try {
@@ -307,6 +311,64 @@ async function handleProjectCallback(
       console.debug("Failed to edit project callback message:", error);
     }
     await ctx.answerCallbackQuery({ text: "Cancelled" });
+    return;
+  }
+
+  // Handle "switch" action from /projects command buttons
+  if (action === "switch" && projectName) {
+    // Look up the project path from alias
+    const projectPath = getProjectByAlias(projectName);
+
+    if (!projectPath) {
+      await ctx.answerCallbackQuery({ text: "Project not found", show_alert: true });
+      return;
+    }
+
+    // Extract project name from path for session manager
+    const pathParts = projectPath.split("/");
+    const projName = pathParts[pathParts.length - 1] || "default";
+
+    // Switch to the project
+    setWorkingDir(projectPath);
+    sessionManager.setCurrentProject(projName);
+
+    if (chatId) {
+      sessionManager.setLastUsed(chatId, projName);
+    }
+
+    // Get alias for display
+    const alias = getProjectAlias(projectPath);
+
+    try {
+      await ctx.editMessageText(
+        `✅ <b>Switched to: ${alias}</b>\n\n` +
+          `<code>${projectPath}</code>\n\n` +
+          `Send a message to start working.`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit project switch message:", error);
+    }
+
+    await ctx.answerCallbackQuery({ text: `Switched to ${alias}` });
+    return;
+  }
+
+  // Handle "create:new" action from /projects "Create New Project" button
+  if (action === "create" && projectName === "new") {
+    try {
+      await ctx.editMessageText(
+        `➕ <b>Create New Project</b>\n\n` +
+          `To create a new project, use:\n` +
+          `<code>/project /path/to/new-project</code>\n\n` +
+          `Example:\n` +
+          `<code>/project /home/ubuntu/Projects/my-app</code>`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit create message:", error);
+    }
+    await ctx.answerCallbackQuery({ text: "See instructions above" });
     return;
   }
 
@@ -357,12 +419,22 @@ async function handleProjectCallback(
       );
       await ctx.answerCallbackQuery({ text: "Send the repo name..." });
 
-      // Store pending clone state in session for next message
-      session.pendingClone = {
+      // Store pending clone state - use project session if available, otherwise global
+      const currentProjectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+      const projectSession = currentProjectName ? sessionManager.getSession(currentProjectName) : null;
+
+      const pendingCloneData = {
         projectName,
         projectPath,
         chatId: ctx.chat?.id,
       };
+
+      if (projectSession) {
+        projectSession.session.pendingClone = pendingCloneData;
+      } else {
+        // Fallback to global session
+        session.pendingClone = pendingCloneData;
+      }
     } catch (error) {
       await ctx.answerCallbackQuery({
         text: `Error: ${error}`,

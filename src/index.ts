@@ -5,8 +5,9 @@
  */
 
 import { Bot } from "grammy";
-import { run, sequentialize } from "@grammyjs/runner";
-import { TELEGRAM_TOKEN, WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "./config";
+import { sequentialize } from "@grammyjs/runner";
+import { TELEGRAM_TOKEN, WORKING_DIR, ALLOWED_USERS, RESTART_FILE, ACTIVE_SESSIONS_FILE, HEARTBEAT_FILE } from "./config";
+import type { ActiveSessionsData, HeartbeatData, ActiveSessionEntry } from "./types";
 import { sessionManager } from "./session-manager";
 import { unlinkSync, readFileSync, existsSync } from "fs";
 import {
@@ -28,6 +29,7 @@ import {
   handleDocument,
   handleCallback,
 } from "./handlers";
+import { scanAndGenerateAliases } from "./project-aliases";
 
 // Create bot instance
 const bot = new Bot(TELEGRAM_TOKEN);
@@ -116,6 +118,22 @@ bot.catch((err) => {
   console.error("Bot error:", err);
 });
 
+// Handle 409 polling conflicts gracefully (don't crash, just wait and retry)
+bot.api.config.use(async (prev, method, payload, signal) => {
+  try {
+    return await prev(method, payload, signal);
+  } catch (error: any) {
+    // If it's a 409 conflict error, wait and let the runner retry
+    if (error?.error_code === 409) {
+      console.warn("409 Conflict detected - another instance may be running. Waiting 35s...");
+      await new Promise(resolve => setTimeout(resolve, 35000));
+      // Retry once after waiting
+      return await prev(method, payload, signal);
+    }
+    throw error;
+  }
+});
+
 // ============== Startup ==============
 
 console.log("=".repeat(50));
@@ -123,11 +141,23 @@ console.log("Claude Telegram Bot - TypeScript Edition");
 console.log("=".repeat(50));
 console.log(`Working directory: ${WORKING_DIR}`);
 console.log(`Allowed users: ${ALLOWED_USERS.length}`);
+
+// Scan and generate project aliases on startup
+await scanAndGenerateAliases();
+
 console.log("Starting bot...");
 
 // Get bot info first
 const botInfo = await bot.api.getMe();
 console.log(`Bot started: @${botInfo.username}`);
+
+// Clear any lingering webhook/polling connections
+try {
+  await bot.api.deleteWebhook({ drop_pending_updates: true });
+  console.log("Cleared previous connections");
+} catch (e) {
+  console.warn("Could not clear connections:", e);
+}
 
 // Check for pending restart message to update
 if (existsSync(RESTART_FILE)) {
@@ -150,25 +180,222 @@ if (existsSync(RESTART_FILE)) {
   }
 }
 
-// Start with concurrent runner (commands work immediately)
-const runner = run(bot);
+// Check for crash via heartbeat file (heartbeat file exists = crash, no graceful shutdown)
+let crashedSessions: ActiveSessionEntry[] = [];
+if (existsSync(HEARTBEAT_FILE)) {
+  try {
+    const heartbeat: HeartbeatData = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf-8"));
+    const age = Date.now() - new Date(heartbeat.last_heartbeat).getTime();
+
+    // If heartbeat is recent (within 2 minutes), this was a crash
+    if (age < 2 * 60 * 1000 && heartbeat.sessions.length > 0) {
+      console.log(`Detected crash! Last heartbeat was ${Math.round(age / 1000)}s ago`);
+      crashedSessions = heartbeat.sessions.filter(s => s.was_running && s.session_id);
+
+      for (const sess of crashedSessions) {
+        try {
+          await bot.api.sendMessage(
+            sess.chat_id,
+            `⚠️ <b>Bot crashed and restarted</b>\n\n` +
+            `Resuming your session. Send a message to continue where you left off.`,
+            { parse_mode: "HTML" }
+          );
+
+          // Restore the session
+          const projectSession = await sessionManager.getOrCreateSession(sess.project_name);
+          if (sess.session_id) {
+            projectSession.session.resumeSession(sess.session_id);
+            console.log(`Resumed crashed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
+          }
+          sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+        } catch (resumeError) {
+          console.warn(`Failed to resume crashed session for chat ${sess.chat_id}:`, resumeError);
+        }
+      }
+    }
+    unlinkSync(HEARTBEAT_FILE);
+  } catch (e) {
+    console.warn("Failed to process heartbeat file:", e);
+    try { unlinkSync(HEARTBEAT_FILE); } catch {}
+  }
+}
+
+// Check for interrupted sessions (from graceful restart) and auto-resume
+if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
+  try {
+    const data: ActiveSessionsData = JSON.parse(
+      readFileSync(ACTIVE_SESSIONS_FILE, "utf-8")
+    );
+
+    const age = Date.now() - new Date(data.shutdown_time).getTime();
+
+    // Only resume if shutdown was recent (within 5 minutes)
+    if (age < 5 * 60 * 1000) {
+      // Filter to only sessions that were actively running
+      const interruptedSessions = data.sessions.filter(s => s.was_running && s.session_id);
+
+      console.log(`Found ${interruptedSessions.length} interrupted sessions to resume`);
+
+      for (const sess of interruptedSessions) {
+        try {
+          // Send notification to chat
+          await bot.api.sendMessage(
+            sess.chat_id,
+            `🔄 <b>Bot restarted</b>\n\n` +
+            `Resuming your session. Send a message to continue where you left off.`,
+            { parse_mode: "HTML" }
+          );
+
+          // Restore the session in session manager
+          const projectSession = await sessionManager.getOrCreateSession(sess.project_name);
+
+          if (sess.session_id) {
+            projectSession.session.resumeSession(sess.session_id);
+            console.log(`Resumed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
+          }
+
+          // Track this chat's project
+          sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+        } catch (resumeError) {
+          console.warn(`Failed to resume session for chat ${sess.chat_id}:`, resumeError);
+        }
+      }
+    } else {
+      console.log(`Active sessions file too old (${Math.round(age / 1000)}s), skipping resume`);
+    }
+
+    // Clean up
+    unlinkSync(ACTIVE_SESSIONS_FILE);
+  } catch (e) {
+    console.warn("Failed to restore interrupted sessions:", e);
+    try { unlinkSync(ACTIVE_SESSIONS_FILE); } catch {}
+  }
+}
+
+// Start polling with retry logic for 409 conflicts
+async function startWithRetry(maxRetries = 3): Promise<void> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await bot.start({
+        drop_pending_updates: true,
+        onStart: () => console.log("Polling started"),
+      });
+      return; // Success
+    } catch (error: any) {
+      if (error?.error_code === 409 && attempt < maxRetries) {
+        console.warn(`409 Conflict on attempt ${attempt}/${maxRetries}. Waiting 35s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, 35000));
+        // Clear webhook again before retry
+        try {
+          await bot.api.deleteWebhook({ drop_pending_updates: true });
+        } catch {}
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
+startWithRetry().catch(err => {
+  console.error("Failed to start bot:", err);
+  process.exit(1);
+});
+
+// Heartbeat interval - writes state every 10 seconds for crash detection
+const HEARTBEAT_INTERVAL = 10_000;
+const startTime = new Date().toISOString();
+
+async function writeHeartbeat(): Promise<void> {
+  const sessions: ActiveSessionEntry[] = [];
+
+  for (const projSess of sessionManager.getAllSessions()) {
+    const chatIds = sessionManager.getChatIdsForProject(projSess.projectName);
+    for (const chatId of chatIds) {
+      if (projSess.session.sessionId) {
+        sessions.push({
+          chat_id: chatId,
+          project_name: projSess.projectName,
+          session_id: projSess.session.sessionId,
+          last_message: projSess.session.lastMessage || undefined,
+          was_running: projSess.isRunning()
+        });
+      }
+    }
+  }
+
+  const heartbeat: HeartbeatData = {
+    pid: process.pid,
+    started_at: startTime,
+    last_heartbeat: new Date().toISOString(),
+    sessions
+  };
+
+  await Bun.write(HEARTBEAT_FILE, JSON.stringify(heartbeat, null, 2));
+}
+
+// Start heartbeat
+const heartbeatTimer = setInterval(writeHeartbeat, HEARTBEAT_INTERVAL);
+writeHeartbeat(); // Write immediately on start
 
 // Graceful shutdown
-const stopRunner = () => {
-  if (runner.isRunning()) {
-    console.log("Stopping bot...");
-    runner.stop();
-  }
+const stopBot = () => {
+  console.log("Stopping bot...");
+  bot.stop();
 };
 
-process.on("SIGINT", () => {
-  console.log("Received SIGINT");
-  stopRunner();
-  process.exit(0);
-});
+/**
+ * Save active sessions state before shutdown.
+ * This allows auto-resume of interrupted sessions on restart.
+ */
+export async function saveActiveSessionsState(reason: "signal" | "restart"): Promise<void> {
+  const activeData: ActiveSessionsData = {
+    shutdown_time: new Date().toISOString(),
+    reason,
+    sessions: []
+  };
 
-process.on("SIGTERM", () => {
-  console.log("Received SIGTERM");
-  stopRunner();
+  // Get all project sessions
+  const allSessions = sessionManager.getAllSessions();
+
+  for (const projSess of allSessions) {
+    // Get all chat IDs that were using this project
+    const chatIds = sessionManager.getChatIdsForProject(projSess.projectName);
+
+    for (const chatId of chatIds) {
+      if (projSess.session.sessionId) {
+        activeData.sessions.push({
+          chat_id: chatId,
+          project_name: projSess.projectName,
+          session_id: projSess.session.sessionId,
+          last_message: projSess.session.lastMessage || undefined,
+          was_running: projSess.isRunning()
+        });
+      }
+    }
+  }
+
+  // Save to file
+  if (activeData.sessions.length > 0) {
+    await Bun.write(ACTIVE_SESSIONS_FILE, JSON.stringify(activeData, null, 2));
+    console.log(`Saved ${activeData.sessions.length} active sessions (${activeData.sessions.filter(s => s.was_running).length} running)`);
+  }
+}
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.log(`Received ${signal}`);
+
+  // Stop heartbeat
+  clearInterval(heartbeatTimer);
+
+  // Delete heartbeat file (signals clean shutdown)
+  try { unlinkSync(HEARTBEAT_FILE); } catch {}
+
+  // Save active sessions state
+  await saveActiveSessionsState("signal");
+
+  stopBot();
   process.exit(0);
-});
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));

@@ -17,6 +17,7 @@ import {
   startTypingIndicator,
 } from "../utils";
 import { StreamingState, createStatusCallback } from "./streaming";
+import { getProjectAlias, getProjectByAlias } from "../project-aliases";
 
 const execAsync = promisify(exec);
 
@@ -89,9 +90,11 @@ function extractMessageContext(ctx: Context): string | null {
  * Handle pending GitHub clone flow.
  * Called when user sends a repo name/URL after clicking "Clone from GitHub".
  */
-async function handlePendingClone(ctx: Context, input: string): Promise<void> {
-  const pending = session.pendingClone!;
-  session.pendingClone = null; // Clear pending state
+async function handlePendingClone(ctx: Context, input: string, pending: {
+  projectName: string;
+  projectPath: string;
+  chatId: number | undefined;
+}): Promise<void> {
 
   // Parse repo input - accept various formats:
   // - username/repo
@@ -185,8 +188,39 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
-  // 1.5. Determine target project (from last-used or default)
-  const projectName = sessionManager.getLastUsed(chatId) || (() => {
+  // 1.4. Parse @project syntax for direct project routing
+  // Format: @projectname message (routes message to that project)
+  let targetProjectFromAtSyntax: string | null = null;
+  const atMatch = message.match(/^@(\S+)\s+(.+)$/s);
+
+  if (atMatch) {
+    const [, projectAlias, remainingMessage] = atMatch;
+
+    // Check if this alias exists
+    const projectPath = getProjectByAlias(projectAlias!);
+    if (projectPath) {
+      targetProjectFromAtSyntax = projectAlias!.toLowerCase();
+      message = remainingMessage!;
+
+      // Switch to this project
+      setWorkingDir(projectPath);
+      const pathParts = projectPath.split("/");
+      const projName = pathParts[pathParts.length - 1] || "default";
+      sessionManager.setCurrentProject(projName);
+      sessionManager.setLastUsed(chatId, projName);
+    } else {
+      // Unknown project alias - warn user and continue with original message
+      await ctx.reply(
+        `⚠️ Unknown project: <code>@${projectAlias}</code>\n\n` +
+          `Use <code>/projects</code> to see available projects.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+  }
+
+  // 1.5. Determine target project (from @-syntax, last-used, or default)
+  const projectName = targetProjectFromAtSyntax || sessionManager.getLastUsed(chatId) || (() => {
     // Extract project name from current working directory
     const workDir = getWorkingDir();
     const pathParts = workDir.split("/");
@@ -196,9 +230,17 @@ export async function handleText(ctx: Context): Promise<void> {
   // Get or create project session
   const projectSession = await sessionManager.getOrCreateSession(projectName);
 
-  // 1.6. Handle pending clone flow (check project-specific session)
-  if (projectSession.session.pendingClone && projectSession.session.pendingClone.chatId === chatId) {
-    await handlePendingClone(ctx, message);
+  // CRITICAL: Track last-used project IMMEDIATELY so subsequent messages route correctly
+  // This ensures that even if this message fails, the next message knows which project to use
+  sessionManager.setLastUsed(chatId, projectName);
+
+  // 1.6. Handle pending clone flow (check project-specific session AND global session)
+  const pendingClone = projectSession.session.pendingClone || session.pendingClone;
+  if (pendingClone && pendingClone.chatId === chatId) {
+    // Clear from both to ensure consistency
+    projectSession.session.pendingClone = null;
+    session.pendingClone = null;
+    await handlePendingClone(ctx, message, pendingClone);
     return;
   }
 
@@ -229,13 +271,18 @@ export async function handleText(ctx: Context): Promise<void> {
     projectSession.session.conversationTitle = title;
   }
 
-  // 6. Show project header based on config
+  // 6. Show project header based on config (with alias)
   const shouldShowHeader =
     SHOW_PROJECT_HEADERS === "always" ||
     (SHOW_PROJECT_HEADERS === "multiple" && sessionManager.getAllSessions().length > 1);
 
-  if (shouldShowHeader && projectName !== "default") {
-    await ctx.reply(`📁 [${projectName}]`, { parse_mode: "HTML" });
+  // Show project switch notification if using @-syntax
+  if (targetProjectFromAtSyntax) {
+    const projectAlias = getProjectAlias(projectSession.workingDir);
+    await ctx.reply(`📁 <b>${projectAlias}</b>`, { parse_mode: "HTML" });
+  } else if (shouldShowHeader && projectName !== "default") {
+    const projectAlias = getProjectAlias(projectSession.workingDir);
+    await ctx.reply(`<b>${projectAlias}</b>:`, { parse_mode: "HTML" });
   }
 
   // 7. Mark processing started (on project session)
@@ -262,8 +309,7 @@ export async function handleText(ctx: Context): Promise<void> {
         ctx
       );
 
-      // 11. Update project tracking
-      sessionManager.setLastUsed(chatId, projectName);
+      // 11. Update project activity (lastUsed already set above)
       projectSession.updateActivity();
 
       // 12. Audit log

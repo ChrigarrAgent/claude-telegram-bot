@@ -81,3 +81,26 @@ export interface PendingMediaGroup {
 
 // Bot context with optional message
 export type BotContext = Context;
+
+// Active sessions tracking for restart/resume
+export interface ActiveSessionEntry {
+  chat_id: number;
+  project_name: string;
+  session_id: string;
+  last_message?: string;
+  was_running: boolean;
+}
+
+export interface ActiveSessionsData {
+  shutdown_time: string;
+  reason: "signal" | "restart" | "crash";
+  sessions: ActiveSessionEntry[];
+}
+
+// Heartbeat data for crash detection
+export interface HeartbeatData {
+  pid: number;
+  started_at: string;
+  last_heartbeat: string;
+  sessions: ActiveSessionEntry[];
+}

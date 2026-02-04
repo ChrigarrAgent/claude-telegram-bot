@@ -109,6 +109,26 @@ class SessionManager {
   }
 
   /**
+   * Get all chat IDs that are using a specific project.
+   */
+  getChatIdsForProject(projectName: string): number[] {
+    const chatIds: number[] = [];
+    for (const [chatId, project] of this.lastUsedPerChat.entries()) {
+      if (project === projectName) {
+        chatIds.push(chatId);
+      }
+    }
+    return chatIds;
+  }
+
+  /**
+   * Get all chat IDs and their associated projects.
+   */
+  getAllChatProjects(): Map<number, string> {
+    return new Map(this.lastUsedPerChat);
+  }
+
+  /**
    * Kill a session (clear session_id and state).
    */
   async killSession(projectName: string): Promise<void> {

@@ -7,8 +7,9 @@
 import type { Context } from "grammy";
 import { session } from "../session";
 import { sessionManager } from "../session-manager";
-import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, PROJECT_ALIASES, getWorkingDir, setWorkingDir } from "../config";
+import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, getWorkingDir, setWorkingDir, resolveProjectPath } from "../config";
 import { isAuthorized } from "../security";
+import { getProjectAlias, getAliasToPathMap, getProjectByAlias } from "../project-aliases";
 
 /**
  * /start - Show welcome message and status.
@@ -23,11 +24,13 @@ export async function handleStart(ctx: Context): Promise<void> {
 
   const status = session.isActive ? "Active session" : "No active session";
   const workDir = getWorkingDir();
+  const projectAlias = getProjectAlias(workDir);
 
   await ctx.reply(
     `🤖 <b>Claude Telegram Bot</b>\n\n` +
       `Status: ${status}\n` +
-      `Working directory: <code>${workDir}</code>\n\n` +
+      `Project: <b>${projectAlias}</b>\n` +
+      `Directory: <code>${workDir}</code>\n\n` +
       `<b>Session Commands:</b>\n` +
       `/new - Start fresh session\n` +
       `/stop - Stop current query\n` +
@@ -58,29 +61,47 @@ export async function handleStart(ctx: Context): Promise<void> {
 }
 
 /**
- * /new - Start a fresh session.
+ * /new - Start a fresh session for the current project.
  */
 export async function handleNew(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
     await ctx.reply("Unauthorized.");
     return;
   }
 
-  // Stop any running query
-  if (session.isRunning) {
-    const result = await session.stop();
-    if (result) {
-      await Bun.sleep(100);
-      session.clearStopRequested();
+  // Get current project for this chat
+  const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+  const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+
+  if (projectSession) {
+    // Stop any running query on this project's session
+    if (projectSession.isRunning()) {
+      const result = await projectSession.session.stop();
+      if (result) {
+        await Bun.sleep(100);
+        projectSession.session.clearStopRequested();
+      }
     }
+
+    // Clear the project's session
+    await projectSession.kill();
+    const projectAlias = getProjectAlias(projectSession.workingDir);
+    await ctx.reply(`🆕 Session cleared for <b>${projectAlias}</b>. Next message starts fresh.`, { parse_mode: "HTML" });
+  } else {
+    // Fallback to global session for backwards compatibility
+    if (session.isRunning) {
+      const result = await session.stop();
+      if (result) {
+        await Bun.sleep(100);
+        session.clearStopRequested();
+      }
+    }
+    await session.kill();
+    await ctx.reply("🆕 Session cleared. Next message starts fresh.");
   }
-
-  // Clear session
-  await session.kill();
-
-  await ctx.reply("🆕 Session cleared. Next message starts fresh.");
 }
 
 /**
@@ -88,22 +109,33 @@ export async function handleNew(ctx: Context): Promise<void> {
  */
 export async function handleStop(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
     await ctx.reply("Unauthorized.");
     return;
   }
 
-  if (session.isRunning) {
+  // Try project-specific session first
+  const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+  const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+
+  if (projectSession && projectSession.isRunning()) {
+    const result = await projectSession.session.stop();
+    if (result) {
+      await Bun.sleep(100);
+      projectSession.session.clearStopRequested();
+    }
+    // Silent stop - no message shown
+  } else if (session.isRunning) {
+    // Fallback to global session
     const result = await session.stop();
     if (result) {
-      // Wait for the abort to be processed, then clear stopRequested so next message can proceed
       await Bun.sleep(100);
       session.clearStopRequested();
     }
-    // Silent stop - no message shown
   }
-  // If nothing running, also stay silent
+  // If nothing running, stay silent
 }
 
 /**
@@ -130,7 +162,8 @@ export async function handleStatus(ctx: Context): Promise<void> {
     const currentSession = allSessions.find(s => s.projectName === currentProject);
 
     if (currentSession) {
-      lines.push(`▶️ <b>CURRENT: ${currentSession.projectName}</b>`);
+      const projectAlias = getProjectAlias(currentSession.workingDir);
+      lines.push(`▶️ <b>CURRENT: ${projectAlias}</b>`);
 
       const sess = currentSession.session;
 
@@ -170,11 +203,12 @@ export async function handleStatus(ctx: Context): Promise<void> {
       lines.push(`\n📁 <b>OTHER PROJECTS:</b>`);
 
       for (const projSess of otherSessions) {
+        const projectAlias = getProjectAlias(projSess.workingDir);
         const status = projSess.isActive() ? "✅" : "⚪";
         const idleTime = Math.floor(projSess.getIdleTime() / 1000);
         const idleStr = idleTime < 60 ? `${idleTime}s` : `${Math.floor(idleTime / 60)}m`;
 
-        lines.push(`  ${status} ${projSess.projectName} (idle ${idleStr})`);
+        lines.push(`  ${status} ${projectAlias} (idle ${idleStr})`);
 
         if (projSess.session.sessionId) {
           lines.push(`     └─ ${projSess.session.sessionId.slice(0, 8)}...`);
@@ -320,10 +354,18 @@ export async function handleRestart(ctx: Context): Promise<void> {
     }
   }
 
+  // Save active sessions state for auto-resume
+  try {
+    const { saveActiveSessionsState } = await import("../index");
+    await saveActiveSessionsState("restart");
+  } catch (e) {
+    console.warn("Failed to save active sessions:", e);
+  }
+
   // Give time for the message to send
   await Bun.sleep(500);
 
-  // Exit - launchd will restart us
+  // Exit - PM2/launchd will restart us
   process.exit(0);
 }
 
@@ -405,14 +447,24 @@ export async function handleProject(ctx: Context): Promise<void> {
   // No args - show current project and list
   if (args.length === 0) {
     const currentDir = getWorkingDir();
-    const projectList = Object.entries(PROJECT_ALIASES)
-      .map(([name, path]) => `  <code>/project ${name}</code> → ${path}`)
+    const currentAlias = getProjectAlias(currentDir);
+    const aliasMap = getAliasToPathMap();
+    const projectList = Object.entries(aliasMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .slice(0, 10) // Show first 10 aliases
+      .map(([alias, path]) => {
+        const isCurrent = path === currentDir;
+        const marker = isCurrent ? " ← current" : "";
+        return `  <code>/project ${alias}</code> → ${path}${marker}`;
+      })
       .join("\n");
 
     await ctx.reply(
       `📁 <b>Current Project</b>\n` +
+        `<b>${currentAlias}</b>\n` +
         `<code>${currentDir}</code>\n\n` +
         `<b>Available Projects:</b>\n${projectList}\n\n` +
+        `Use <code>/projects</code> to see all projects with buttons.\n\n` +
         `<b>Usage:</b>\n` +
         `<code>/project name</code> - Switch to project\n` +
         `<code>/project name &lt;prompt&gt;</code> - Switch and send prompt\n` +
@@ -428,9 +480,10 @@ export async function handleProject(ctx: Context): Promise<void> {
   const optionalPrompt = text.slice(promptStartIndex).trim();
   let newDir: string;
 
-  // Check if it's an alias
-  if (PROJECT_ALIASES[target]) {
-    newDir = PROJECT_ALIASES[target]!;
+  // Check if it's an alias (using auto-generated aliases)
+  const aliasPath = getProjectByAlias(target);
+  if (aliasPath) {
+    newDir = aliasPath;
   } else if (target.startsWith("/") || target.startsWith("~")) {
     // It's a path
     newDir = target.replace(/^~/, process.env.HOME || "/home/ubuntu");
@@ -496,10 +549,14 @@ export async function handleProject(ctx: Context): Promise<void> {
     sessionManager.setLastUsed(chatId, projectName);
   }
 
+  // Generate/get alias for display
+  const projectAlias = getProjectAlias(newDir);
+
   // If prompt provided, send it immediately
   if (optionalPrompt) {
     await ctx.reply(
-      `✅ <b>Switched to:</b> <code>${newDir}</code>\n\n` +
+      `✅ <b>Switched to: ${projectAlias}</b>\n` +
+        `<code>${newDir}</code>\n\n` +
         `🚀 Sending prompt...`,
       { parse_mode: "HTML" }
     );
@@ -517,7 +574,8 @@ export async function handleProject(ctx: Context): Promise<void> {
     await handleText(fakeCtx);
   } else {
     await ctx.reply(
-      `✅ <b>Switched to:</b> <code>${projectName}</code>\n\n` +
+      `✅ <b>Switched to: ${projectAlias}</b>\n` +
+        `<code>${newDir}</code>\n\n` +
         `Next message will use this project.`,
       { parse_mode: "HTML" }
     );
@@ -684,7 +742,7 @@ export async function handleUsage(ctx: Context): Promise<void> {
 }
 
 /**
- * /projects - List all available projects.
+ * /projects - List all available projects with interactive buttons.
  */
 export async function handleProjects(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
@@ -694,59 +752,66 @@ export async function handleProjects(ctx: Context): Promise<void> {
     return;
   }
 
-  const { existsSync, readdirSync, statSync } = await import("fs");
   const currentDir = getWorkingDir();
+  const currentAlias = getProjectAlias(currentDir);
 
-  // Get project aliases
-  const aliasLines = Object.entries(PROJECT_ALIASES)
-    .map(([name, path]) => {
-      const isCurrent = path === currentDir;
-      const marker = isCurrent ? " ← current" : "";
-      return `  <code>${name}</code> → ${path}${marker}`;
-    })
-    .join("\n");
+  // Get all project aliases
+  const aliasMap = getAliasToPathMap();
+  const projects = Object.entries(aliasMap)
+    .sort(([a], [b]) => a.localeCompare(b));
 
-  // Scan Projects directory for additional projects
-  const projectsDir = "/home/ubuntu/Projects";
-  let discoveredProjects: string[] = [];
+  if (projects.length === 0) {
+    await ctx.reply(
+      "📁 <b>No Projects Found</b>\n\n" +
+        "No projects have been discovered yet.\n" +
+        "Use <code>/project /path/to/dir</code> to add one.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
 
-  if (existsSync(projectsDir)) {
-    try {
-      discoveredProjects = readdirSync(projectsDir)
-        .filter((name) => {
-          const fullPath = `${projectsDir}/${name}`;
-          try {
-            return statSync(fullPath).isDirectory() && !name.startsWith(".");
-          } catch {
-            return false;
-          }
-        })
-        .filter((name) => !Object.keys(PROJECT_ALIASES).includes(name));
-    } catch {
-      // Ignore errors
+  // Create inline keyboard buttons (2 per row)
+  const buttons: { text: string; callback_data: string }[][] = [];
+
+  for (let i = 0; i < projects.length; i += 2) {
+    const row: { text: string; callback_data: string }[] = [];
+
+    // First button in row
+    const [alias1] = projects[i]!;
+    const isCurrent1 = alias1 === currentAlias;
+    row.push({
+      text: isCurrent1 ? `▶️ ${alias1}` : alias1,
+      callback_data: `project:switch:${alias1}`,
+    });
+
+    // Second button in row (if exists)
+    if (projects[i + 1]) {
+      const [alias2] = projects[i + 1]!;
+      const isCurrent2 = alias2 === currentAlias;
+      row.push({
+        text: isCurrent2 ? `▶️ ${alias2}` : alias2,
+        callback_data: `project:switch:${alias2}`,
+      });
     }
+
+    buttons.push(row);
   }
 
-  let discoveredSection = "";
-  if (discoveredProjects.length > 0) {
-    const discoveredLines = discoveredProjects
-      .map((name) => {
-        const fullPath = `${projectsDir}/${name}`;
-        const isCurrent = fullPath === currentDir;
-        const marker = isCurrent ? " ← current" : "";
-        return `  <code>${name}</code>${marker}`;
-      })
-      .join("\n");
-    discoveredSection = `\n\n<b>Other Projects (~/Projects/):</b>\n${discoveredLines}`;
-  }
+  // Add "Create New Project" button
+  buttons.push([
+    { text: "➕ Create New Project", callback_data: "project:create:new" },
+  ]);
 
   await ctx.reply(
-    `📁 <b>Available Projects</b>\n\n` +
-      `<b>Aliases:</b>\n${aliasLines}${discoveredSection}\n\n` +
-      `<b>Usage:</b>\n` +
-      `<code>/project name</code> - Switch to project\n` +
-      `<code>/project /path</code> - Switch to custom path`,
-    { parse_mode: "HTML" }
+    `📁 <b>Available Projects</b> (${projects.length})\n\n` +
+      `Current: <b>${currentAlias}</b>\n\n` +
+      `Select a project to switch:`,
+    {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: buttons,
+      },
+    }
   );
 }
 
@@ -755,26 +820,32 @@ export async function handleProjects(ctx: Context): Promise<void> {
  */
 export async function handleRetry(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
     await ctx.reply("Unauthorized.");
     return;
   }
 
+  // Get project-specific session
+  const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+  const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+  const lastMessage = projectSession?.session.lastMessage || session.lastMessage;
+
   // Check if there's a message to retry
-  if (!session.lastMessage) {
+  if (!lastMessage) {
     await ctx.reply("❌ No message to retry.");
     return;
   }
 
   // Check if something is already running
-  if (session.isRunning) {
+  const isRunning = projectSession?.isRunning() || session.isRunning;
+  if (isRunning) {
     await ctx.reply("⏳ A query is already running. Use /stop first.");
     return;
   }
 
-  const message = session.lastMessage;
-  await ctx.reply(`🔄 Retrying: "${message.slice(0, 50)}${message.length > 50 ? "..." : ""}"`);
+  await ctx.reply(`🔄 Retrying: "${lastMessage.slice(0, 50)}${lastMessage.length > 50 ? "..." : ""}"`);
 
   // Simulate sending the message again by emitting a fake text message event
   // We do this by directly calling the text handler logic
@@ -785,7 +856,7 @@ export async function handleRetry(ctx: Context): Promise<void> {
     ...ctx,
     message: {
       ...ctx.message,
-      text: message,
+      text: lastMessage,
     },
   } as Context;
 

@@ -48,27 +48,22 @@ export const getWorkingDir = () => _workingDir;
 export const setWorkingDir = (dir: string) => { _workingDir = dir; };
 export const WORKING_DIR = process.env.CLAUDE_WORKING_DIR || HOME; // Initial value
 
-// Project aliases for quick switching
-export const PROJECT_ALIASES: Record<string, string> = {
-  "home": HOME,
-  "aegir": "/home/ubuntu/Projects/aegir",
-  "openclaw": "/home/ubuntu/.openclaw/workspace",
-  "projects": "/home/ubuntu/Projects",
-  "telegram-bot": "/home/ubuntu/Projects/claude-telegram-bot",
-};
-
 /**
  * Resolve project name to full path.
  * Resolution order:
- * 1. PROJECT_ALIASES map
+ * 1. Auto-generated alias lookup (from project-aliases.ts)
  * 2. /home/ubuntu/Projects/{name}
  * 3. /home/ubuntu/.openclaw/workspace/{name}
  * 4. Absolute path (if starts with / or ~)
  */
 export function resolveProjectPath(projectName: string): string {
-  // Check aliases first
-  if (PROJECT_ALIASES[projectName]) {
-    return PROJECT_ALIASES[projectName]!;
+  // Dynamic import to avoid circular dependency
+  const { getProjectByAlias } = require("./project-aliases");
+
+  // Check auto-generated aliases first
+  const aliasPath = getProjectByAlias(projectName);
+  if (aliasPath) {
+    return aliasPath;
   }
 
   // Absolute path
@@ -284,6 +279,8 @@ export const RATE_LIMIT_WINDOW = parseInt(
 
 export const SESSION_FILE = "/tmp/claude-telegram-session.json";
 export const RESTART_FILE = "/tmp/claude-telegram-restart.json";
+export const ACTIVE_SESSIONS_FILE = "/tmp/claude-telegram-active.json";
+export const HEARTBEAT_FILE = "/tmp/claude-telegram-heartbeat.json";
 export const TEMP_DIR = "/tmp/telegram-bot";
 
 // Temp paths that are always allowed for bot operations
