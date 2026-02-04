@@ -128,10 +128,26 @@ function generateAlias(projectPath: string): string {
 }
 
 /**
- * Get alias for a project path.
- * Auto-generates and saves if not exists.
+ * Get alias for a project path (display only, doesn't auto-save).
+ * Returns existing alias if found, or generates a temporary one for display.
  */
 export function getProjectAlias(projectPath: string): string {
+  const aliases = loadAliases();
+
+  // Check if alias already exists
+  if (aliases[projectPath]) {
+    return aliases[projectPath]!;
+  }
+
+  // Generate alias for display (not saved)
+  return generateAlias(projectPath);
+}
+
+/**
+ * Get or create alias for a project path (saves to disk).
+ * Use this when explicitly adding a project via /project command.
+ */
+export function getOrCreateProjectAlias(projectPath: string): string {
   const aliases = loadAliases();
 
   // Check if alias already exists

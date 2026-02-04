@@ -9,7 +9,7 @@ import { session } from "../session";
 import { sessionManager } from "../session-manager";
 import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, getWorkingDir, setWorkingDir, resolveProjectPath } from "../config";
 import { isAuthorized } from "../security";
-import { getProjectAlias, getAliasToPathMap, getProjectByAlias } from "../project-aliases";
+import { getProjectAlias, getOrCreateProjectAlias, getAliasToPathMap, getProjectByAlias } from "../project-aliases";
 
 /**
  * /start - Show welcome message and status.
@@ -549,8 +549,8 @@ export async function handleProject(ctx: Context): Promise<void> {
     sessionManager.setLastUsed(chatId, projectName);
   }
 
-  // Generate/get alias for display
-  const projectAlias = getProjectAlias(newDir);
+  // Generate/get alias and save it (explicit project switch)
+  const projectAlias = getOrCreateProjectAlias(newDir);
 
   // If prompt provided, send it immediately
   if (optionalPrompt) {
