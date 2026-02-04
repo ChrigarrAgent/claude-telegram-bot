@@ -20,12 +20,22 @@ export interface SessionStatus {
 }
 
 /**
+ * Pending clone state for a chat (stored separately from sessions to avoid cross-chat leakage).
+ */
+export interface PendingClone {
+  projectName: string;
+  projectPath: string;
+  chatId: number;
+}
+
+/**
  * SessionManager coordinates multiple ProjectSession instances.
  */
 class SessionManager {
   private sessions = new Map<string, ProjectSession>();
   private creationLocks = new Map<string, Promise<ProjectSession>>();
   private lastUsedPerChat = new Map<number, string>();
+  private pendingClonePerChat = new Map<number, PendingClone>();
   private currentProject: string = "default";
 
   /**
@@ -139,6 +149,28 @@ class SessionManager {
   }
 
   /**
+   * Set pending clone state for a chat.
+   * Stored per-chat to avoid cross-chat leakage.
+   */
+  setPendingClone(chatId: number, data: PendingClone): void {
+    this.pendingClonePerChat.set(chatId, data);
+  }
+
+  /**
+   * Get pending clone state for a chat.
+   */
+  getPendingClone(chatId: number): PendingClone | null {
+    return this.pendingClonePerChat.get(chatId) || null;
+  }
+
+  /**
+   * Clear pending clone state for a chat.
+   */
+  clearPendingClone(chatId: number): void {
+    this.pendingClonePerChat.delete(chatId);
+  }
+
+  /**
    * Get status for a specific project.
    */
   getSessionStatus(projectName: string): SessionStatus | null {
@@ -174,6 +206,17 @@ class SessionManager {
 
 // Global singleton
 export const sessionManager = new SessionManager();
+
+/**
+ * Reset session manager state (for testing only).
+ */
+export function resetSessionManager(): void {
+  sessionManager["sessions"].clear();
+  sessionManager["creationLocks"].clear();
+  sessionManager["lastUsedPerChat"].clear();
+  sessionManager["pendingClonePerChat"].clear();
+  sessionManager["currentProject"] = "default";
+}
 
 /**
  * Legacy compatibility export.

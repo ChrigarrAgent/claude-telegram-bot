@@ -387,12 +387,20 @@ async function handleProjectCallback(
 
       // Switch to the new project
       setWorkingDir(projectPath);
-      await session.kill();
+      sessionManager.setCurrentProject(projectName);
+      if (chatId) {
+        sessionManager.setLastUsed(chatId, projectName);
+      }
+
+      // Note: We don't kill any session here because:
+      // 1. This is a NEW project, so there's no existing session to kill
+      // 2. Killing the global session would affect other projects
+      // The next message will create a fresh session for this new project
 
       await ctx.editMessageText(
         `✅ <b>Created project:</b> <code>${projectName}</code>\n\n` +
           `📁 Path: <code>${projectPath}</code>\n\n` +
-          `Session cleared. Next message starts fresh in this project.`,
+          `Next message starts fresh in this project.`,
         { parse_mode: "HTML" }
       );
       await ctx.answerCallbackQuery({ text: "Project created!" });
@@ -419,21 +427,14 @@ async function handleProjectCallback(
       );
       await ctx.answerCallbackQuery({ text: "Send the repo name..." });
 
-      // Store pending clone state - use project session if available, otherwise global
-      const currentProjectName = chatId ? sessionManager.getLastUsed(chatId) : null;
-      const projectSession = currentProjectName ? sessionManager.getSession(currentProjectName) : null;
-
-      const pendingCloneData = {
-        projectName,
-        projectPath,
-        chatId: ctx.chat?.id,
-      };
-
-      if (projectSession) {
-        projectSession.session.pendingClone = pendingCloneData;
-      } else {
-        // Fallback to global session
-        session.pendingClone = pendingCloneData;
+      // Store pending clone state in sessionManager (per-chat, not per-session)
+      // This prevents cross-chat leakage when multiple users use the bot
+      if (chatId) {
+        sessionManager.setPendingClone(chatId, {
+          projectName,
+          projectPath,
+          chatId,
+        });
       }
     } catch (error) {
       await ctx.answerCallbackQuery({

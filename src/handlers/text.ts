@@ -5,7 +5,6 @@
 import type { Context } from "grammy";
 import { exec } from "child_process";
 import { promisify } from "util";
-import { session } from "../session";
 import { sessionManager } from "../session-manager";
 import type { ProjectSession } from "../project-session";
 import { ALLOWED_USERS, setWorkingDir, SHOW_PROJECT_HEADERS, getWorkingDir, resolveProjectPath } from "../config";
@@ -139,7 +138,14 @@ async function handlePendingClone(ctx: Context, input: string, pending: {
 
     // Switch to the cloned project
     setWorkingDir(pending.projectPath);
-    await session.kill();
+    sessionManager.setCurrentProject(pending.projectName);
+    if (pending.chatId) {
+      sessionManager.setLastUsed(pending.chatId, pending.projectName);
+    }
+
+    // Note: We don't kill any session here because:
+    // 1. This is a NEW project, so there's no existing session to kill
+    // 2. Killing the global session would affect other projects
 
     // Update status message
     await ctx.api.editMessageText(
@@ -147,7 +153,7 @@ async function handlePendingClone(ctx: Context, input: string, pending: {
       statusMsg.message_id,
       `✅ <b>Cloned:</b> <code>${repo}</code>\n\n` +
         `📁 Path: <code>${pending.projectPath}</code>\n\n` +
-        `Session cleared. Next message starts fresh in this project.`,
+        `Next message starts fresh in this project.`,
       { parse_mode: "HTML" }
     );
   } catch (error) {
@@ -234,12 +240,10 @@ export async function handleText(ctx: Context): Promise<void> {
   // This ensures that even if this message fails, the next message knows which project to use
   sessionManager.setLastUsed(chatId, projectName);
 
-  // 1.6. Handle pending clone flow (check project-specific session AND global session)
-  const pendingClone = projectSession.session.pendingClone || session.pendingClone;
-  if (pendingClone && pendingClone.chatId === chatId) {
-    // Clear from both to ensure consistency
-    projectSession.session.pendingClone = null;
-    session.pendingClone = null;
+  // 1.6. Handle pending clone flow (stored per-chat in sessionManager)
+  const pendingClone = sessionManager.getPendingClone(chatId);
+  if (pendingClone) {
+    sessionManager.clearPendingClone(chatId);
     await handlePendingClone(ctx, message, pendingClone);
     return;
   }

@@ -93,13 +93,6 @@ export class ClaudeSession {
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
 
-  // Pending clone state (set by callback handler when user clicks "Clone from GitHub")
-  pendingClone: {
-    projectName: string;
-    projectPath: string;
-    chatId: number | undefined;
-  } | null = null;
-
   private abortController: AbortController | null = null;
   private isQueryRunning = false;
   private stopRequested = false;

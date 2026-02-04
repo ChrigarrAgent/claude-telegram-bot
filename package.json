@@ -6,7 +6,10 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
-    "typecheck": "bun run --bun tsc --noEmit"
+    "typecheck": "bun run --bun tsc --noEmit",
+    "test": "bun run test:unit && bun run test:e2e",
+    "test:unit": "bun test tests/multi-project.test.ts tests/handlers.test.ts",
+    "test:e2e": "bun test tests/e2e/"
   },
   "devDependencies": {
     "@types/bun": "latest"
