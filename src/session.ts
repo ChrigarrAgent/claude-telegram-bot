@@ -42,22 +42,25 @@ import type {
 
 /**
  * Determine thinking token budget based on message keywords.
+ * Default: thinking is ON (10000 tokens)
+ * Use /fast or /f to disable thinking (returns undefined to omit maxThinkingTokens)
+ * Use deep thinking keywords for extended thinking (50000 tokens)
  */
-function getThinkingLevel(message: string): number {
+function getThinkingLevel(message: string): number | undefined {
   const msgLower = message.toLowerCase();
 
-  // Check deep thinking triggers first (more specific)
+  // Check for fast mode (disable thinking) - use word boundary regex to avoid matching /fix, /format, etc.
+  if (/\/fast\b/i.test(message) || /\/f\b/i.test(message)) {
+    return undefined; // Don't pass maxThinkingTokens → SDK default (thinking OFF)
+  }
+
+  // Check deep thinking triggers (more thinking tokens)
   if (THINKING_DEEP_KEYWORDS.some((k) => msgLower.includes(k))) {
     return 50000;
   }
 
-  // Check normal thinking triggers
-  if (THINKING_KEYWORDS.some((k) => msgLower.includes(k))) {
-    return 10000;
-  }
-
-  // Default: no thinking
-  return 0;
+  // Default: normal thinking ON
+  return 10000;
 }
 
 /**
@@ -192,11 +195,14 @@ export class ClaudeSession {
     const isNewSession = !this.isActive;
     const thinkingTokens = getThinkingLevel(message);
     const thinkingLabel =
-      { 0: "off", 10000: "normal", 50000: "deep" }[thinkingTokens] ||
-      String(thinkingTokens);
+      thinkingTokens === undefined
+        ? "off"
+        : { 10000: "normal", 50000: "deep" }[thinkingTokens] || String(thinkingTokens);
+
+    // Strip /fast or /f from message before sending to Claude
+    let messageToSend = message.replace(/\/fast\b/gi, "").replace(/\/f\b/gi, "").trim();
 
     // Inject current date/time at session start so Claude doesn't need to call a tool for it
-    let messageToSend = message;
     if (isNewSession) {
       const now = new Date();
       const datePrefix = `[Current date/time: ${now.toLocaleDateString(
@@ -211,7 +217,7 @@ export class ClaudeSession {
           timeZoneName: "short",
         }
       )}]\n\n`;
-      messageToSend = datePrefix + message;
+      messageToSend = datePrefix + messageToSend;
     }
 
     // Build SDK V1 options - supports all features
@@ -223,7 +229,8 @@ export class ClaudeSession {
       allowDangerouslySkipPermissions: true,
       systemPrompt: SAFETY_PROMPT,
       mcpServers: MCP_SERVERS,
-      maxThinkingTokens: thinkingTokens,
+      // Only include maxThinkingTokens when defined (undefined = SDK default = thinking OFF)
+      ...(thinkingTokens !== undefined && { maxThinkingTokens: thinkingTokens }),
       additionalDirectories: ALLOWED_PATHS,
       resume: this.sessionId || undefined,
     };
@@ -712,12 +719,10 @@ export class ClaudeSession {
       return [false, "Session not found"];
     }
 
-    if (sessionData.working_dir && sessionData.working_dir !== WORKING_DIR) {
-      return [
-        false,
-        `Session is for different directory: ${sessionData.working_dir}`,
-      ];
-    }
+    // NOTE: We don't check working_dir anymore because:
+    // 1. WORKING_DIR is a stale constant from startup time
+    // 2. Multi-project sessions should be resumable regardless of current dir
+    // 3. The SDK's resume parameter handles directory mismatches gracefully
 
     this.sessionId = sessionData.session_id;
     this.conversationTitle = sessionData.title;
