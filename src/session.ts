@@ -15,6 +15,7 @@ import type { Context } from "grammy";
 import {
   ALLOWED_PATHS,
   MCP_SERVERS,
+  QUERY_TIMEOUT_MS,
   SAFETY_PROMPT,
   SESSION_FILE,
   STREAMING_THROTTLE_MS,
@@ -76,8 +77,9 @@ function getTextFromMessage(msg: SDKMessage): string | null {
 /**
  * Manages Claude Code sessions using the Agent SDK V1.
  */
-// Maximum number of sessions to keep in history
-const MAX_SESSIONS = 5;
+// Maximum number of sessions to keep per project
+const SESSIONS_PER_PROJECT = 3;
+const DEFAULT_PROJECT_NAME = "default";
 
 export class ClaudeSession {
   sessionId: string | null = null;
@@ -272,6 +274,23 @@ export class ClaudeSession {
     let queryCompleted = false;
     let askUserTriggered = false;
 
+    // Activity timeout - abort if no events received for too long
+    let activityTimeout: Timer | null = null;
+    const resetActivityTimeout = () => {
+      if (activityTimeout) clearTimeout(activityTimeout);
+      activityTimeout = setTimeout(() => {
+        console.warn(`Query timeout - no activity for ${QUERY_TIMEOUT_MS / 1000}s`);
+        this.stopRequested = true;
+        this.abortController?.abort();
+      }, QUERY_TIMEOUT_MS);
+    };
+    const clearActivityTimeout = () => {
+      if (activityTimeout) {
+        clearTimeout(activityTimeout);
+        activityTimeout = null;
+      }
+    };
+
     try {
       // Use V1 query() API - supports all options including cwd, mcpServers, etc.
       const queryInstance = query({
@@ -282,8 +301,14 @@ export class ClaudeSession {
         },
       });
 
+      // Start activity timeout
+      resetActivityTimeout();
+
       // Process streaming response
       for await (const event of queryInstance) {
+        // Reset timeout on any activity
+        resetActivityTimeout();
+
         // Check for abort
         if (this.stopRequested) {
           console.log("Query aborted by user");
@@ -492,6 +517,7 @@ export class ClaudeSession {
         throw error;
       }
     } finally {
+      clearActivityTimeout();
       this.isQueryRunning = false;
       this.abortController = null;
       this.queryStarted = null;
@@ -529,6 +555,32 @@ export class ClaudeSession {
   }
 
   /**
+   * Trim session history to keep only SESSIONS_PER_PROJECT per project.
+   * Groups sessions by project and keeps the most recent sessions for each.
+   */
+  private trimSessionHistory(history: SessionHistory): void {
+    const groupedByProject = new Map<string, SavedSession[]>();
+
+    // Group sessions by project
+    for (const session of history.sessions) {
+      const projName = session.project || DEFAULT_PROJECT_NAME;
+      if (!groupedByProject.has(projName)) {
+        groupedByProject.set(projName, []);
+      }
+      groupedByProject.get(projName)!.push(session);
+    }
+
+    // Trim each project to SESSIONS_PER_PROJECT
+    const trimmedSessions: SavedSession[] = [];
+    for (const [, sessions] of groupedByProject.entries()) {
+      // Keep only the most recent SESSIONS_PER_PROJECT for this project
+      trimmedSessions.push(...sessions.slice(0, SESSIONS_PER_PROJECT));
+    }
+
+    history.sessions = trimmedSessions;
+  }
+
+  /**
    * Save session to disk for resume after restart.
    * Saves to multi-session history format.
    */
@@ -541,7 +593,7 @@ export class ClaudeSession {
 
       // Create new session entry with project name
       const workDir = getWorkingDir();
-      const projectName = workDir.split("/").pop() || "home";
+      const projectName = workDir.split("/").pop() || DEFAULT_PROJECT_NAME;
       const newSession: SavedSession = {
         session_id: this.sessionId,
         saved_at: new Date().toISOString(),
@@ -561,8 +613,8 @@ export class ClaudeSession {
         history.sessions.unshift(newSession);
       }
 
-      // Keep only the last MAX_SESSIONS
-      history.sessions = history.sessions.slice(0, MAX_SESSIONS);
+      // Keep only the last SESSIONS_PER_PROJECT per project
+      this.trimSessionHistory(history);
 
       // Save
       Bun.write(SESSION_FILE, JSON.stringify(history, null, 2));
