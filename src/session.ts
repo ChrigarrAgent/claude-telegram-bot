@@ -26,6 +26,10 @@ import {
 } from "./config";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
+import {
+  requestSafetyConfirmation,
+  waitForSafetyDecision,
+} from "./handlers/safety-confirmation";
 import { checkCommandSafety, isPathAllowed } from "./security";
 import type {
   SavedSession,
@@ -75,7 +79,7 @@ function getTextFromMessage(msg: SDKMessage): string | null {
 // Maximum number of sessions to keep in history
 const MAX_SESSIONS = 5;
 
-class ClaudeSession {
+export class ClaudeSession {
   sessionId: string | null = null;
   lastActivity: Date | null = null;
   queryStarted: Date | null = null;
@@ -86,6 +90,13 @@ class ClaudeSession {
   lastUsage: TokenUsage | null = null;
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
+
+  // Pending clone state (set by callback handler when user clicks "Clone from GitHub")
+  pendingClone: {
+    projectName: string;
+    projectPath: string;
+    chatId: number | undefined;
+  } | null = null;
 
   private abortController: AbortController | null = null;
   private isQueryRunning = false;
@@ -304,18 +315,38 @@ class ClaudeSession {
               const toolInput = block.input as Record<string, unknown>;
 
               // Safety check for Bash commands
-              if (toolName === "Bash") {
+              if (toolName === "Bash" && ctx && chatId) {
                 const command = String(toolInput.command || "");
                 const [isSafe, reason] = checkCommandSafety(command);
                 if (!isSafe) {
-                  console.warn(`BLOCKED: ${reason}`);
-                  await statusCallback("tool", `BLOCKED: ${reason}`);
-                  throw new Error(`Unsafe command blocked: ${reason}`);
+                  console.warn(`UNSAFE COMMAND: ${reason} - requesting confirmation`);
+                  await statusCallback("tool", `⚠️ Requesting confirmation for: ${reason}`);
+
+                  // Request confirmation via Telegram buttons
+                  const requestId = await requestSafetyConfirmation(
+                    ctx,
+                    chatId,
+                    "command",
+                    reason,
+                    command
+                  );
+
+                  // Wait for user decision
+                  const allowed = await waitForSafetyDecision(requestId);
+
+                  if (!allowed) {
+                    console.warn(`User denied: ${reason}`);
+                    await statusCallback("tool", `❌ Command blocked by user: ${reason}`);
+                    throw new Error(`Command blocked by user: ${reason}`);
+                  }
+
+                  console.log(`User allowed: ${command}`);
+                  await statusCallback("tool", `✅ Command allowed by user`);
                 }
               }
 
               // Safety check for file operations
-              if (["Read", "Write", "Edit"].includes(toolName)) {
+              if (["Read", "Write", "Edit"].includes(toolName) && ctx && chatId) {
                 const filePath = String(toolInput.file_path || "");
                 if (filePath) {
                   // Allow reads from temp paths and .claude directories
@@ -326,10 +357,30 @@ class ClaudeSession {
 
                   if (!isTmpRead && !isPathAllowed(filePath)) {
                     console.warn(
-                      `BLOCKED: File access outside allowed paths: ${filePath}`
+                      `UNSAFE FILE OPERATION: Access outside allowed paths: ${filePath} - requesting confirmation`
                     );
-                    await statusCallback("tool", `Access denied: ${filePath}`);
-                    throw new Error(`File access blocked: ${filePath}`);
+                    await statusCallback("tool", `🔒 Requesting confirmation for file access`);
+
+                    // Request confirmation via Telegram buttons
+                    const requestId = await requestSafetyConfirmation(
+                      ctx,
+                      chatId,
+                      "file_operation",
+                      `${toolName} file outside allowed paths`,
+                      filePath
+                    );
+
+                    // Wait for user decision
+                    const allowed = await waitForSafetyDecision(requestId);
+
+                    if (!allowed) {
+                      console.warn(`User denied file access: ${filePath}`);
+                      await statusCallback("tool", `❌ File access blocked by user: ${filePath}`);
+                      throw new Error(`File access blocked by user: ${filePath}`);
+                    }
+
+                    console.log(`User allowed file access: ${filePath}`);
+                    await statusCallback("tool", `✅ File access allowed by user`);
                   }
                 }
               }
@@ -540,13 +591,20 @@ class ClaudeSession {
 
   /**
    * Get list of saved sessions for display.
+   * @param filterByProject - Optional project name to filter by (if undefined, returns all sessions)
    */
-  getSessionList(): SavedSession[] {
+  getSessionList(filterByProject?: string): SavedSession[] {
     const history = this.loadSessionHistory();
-    // Filter to only sessions for current working directory
-    return history.sessions.filter(
-      (s) => !s.working_dir || s.working_dir === WORKING_DIR
-    );
+
+    // If filter specified, return only sessions for that project
+    if (filterByProject !== undefined) {
+      return history.sessions.filter(
+        (s) => s.project === filterByProject || s.working_dir === filterByProject
+      );
+    }
+
+    // Return ALL sessions (no filtering)
+    return history.sessions;
   }
 
   /**
@@ -557,13 +615,13 @@ class ClaudeSession {
     const sessionData = history.sessions.find((s) => s.session_id === sessionId);
 
     if (!sessionData) {
-      return [false, "Sessione non trovata"];
+      return [false, "Session not found"];
     }
 
     if (sessionData.working_dir && sessionData.working_dir !== WORKING_DIR) {
       return [
         false,
-        `Sessione per directory diversa: ${sessionData.working_dir}`,
+        `Session is for different directory: ${sessionData.working_dir}`,
       ];
     }
 
@@ -577,7 +635,7 @@ class ClaudeSession {
 
     return [
       true,
-      `Ripresa sessione: "${sessionData.title}"`,
+      `Resumed session: "${sessionData.title}"`,
     ];
   }
 
@@ -587,7 +645,7 @@ class ClaudeSession {
   resumeLast(): [success: boolean, message: string] {
     const sessions = this.getSessionList();
     if (sessions.length === 0) {
-      return [false, "Nessuna sessione salvata"];
+      return [false, "No saved sessions"];
     }
 
     return this.resumeSession(sessions[0]!.session_id);

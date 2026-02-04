@@ -7,10 +7,12 @@
 import type { Context } from "grammy";
 import { unlinkSync } from "fs";
 import { session } from "../session";
-import { ALLOWED_USERS } from "../config";
+import { sessionManager } from "../session-manager";
+import { ALLOWED_USERS, setWorkingDir, resolveProjectPath } from "../config";
 import { isAuthorized } from "../security";
 import { auditLog, startTypingIndicator } from "../utils";
 import { StreamingState, createStatusCallback } from "./streaming";
+import { updateSafetyRequest } from "./safety-confirmation";
 
 /**
  * Handle callback queries from inline keyboards.
@@ -38,7 +40,19 @@ export async function handleCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // 3. Parse callback data: askuser:{request_id}:{option_index}
+  // 2.5. Handle project callbacks: project:create|clone|cancel:{name}
+  if (callbackData.startsWith("project:")) {
+    await handleProjectCallback(ctx, callbackData);
+    return;
+  }
+
+  // 3. Handle safety confirmation callbacks: safety:{request_id}:allow|deny
+  if (callbackData.startsWith("safety:")) {
+    await handleSafetyCallback(ctx, callbackData);
+    return;
+  }
+
+  // 4. Parse callback data: askuser:{request_id}:{option_index}
   if (!callbackData.startsWith("askuser:")) {
     await ctx.answerCallbackQuery();
     return;
@@ -153,7 +167,48 @@ export async function handleCallback(ctx: Context): Promise<void> {
 }
 
 /**
- * Handle resume session callback (resume:{session_id}).
+ * Handle safety confirmation callback (safety:{request_id}:allow|deny).
+ */
+async function handleSafetyCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const parts = callbackData.split(":");
+  if (parts.length !== 3) {
+    await ctx.answerCallbackQuery({ text: "Invalid callback data" });
+    return;
+  }
+
+  const requestId = parts[1]!;
+  const decision = parts[2]! as "allow" | "deny";
+
+  // Update the request file
+  const updated = await updateSafetyRequest(
+    requestId,
+    decision === "allow" ? "allowed" : "denied"
+  );
+
+  if (!updated) {
+    await ctx.answerCallbackQuery({ text: "Request expired or invalid" });
+    return;
+  }
+
+  // Update the message to show decision
+  const emoji = decision === "allow" ? "✅" : "❌";
+  const action = decision === "allow" ? "Allowed" : "Blocked";
+  try {
+    await ctx.editMessageText(`${emoji} ${action} by user`);
+  } catch (error) {
+    console.debug("Failed to edit safety callback message:", error);
+  }
+
+  await ctx.answerCallbackQuery({
+    text: `Operation ${action.toLowerCase()}`,
+  });
+}
+
+/**
+ * Handle resume session callback (resume:{session_id}:{project_name}).
  */
 async function handleResumeCallback(
   ctx: Context,
@@ -162,21 +217,39 @@ async function handleResumeCallback(
   const userId = ctx.from?.id;
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
-  const sessionId = callbackData.replace("resume:", "");
+
+  // Parse callback data: resume:{session_id}:{project_name}
+  const parts = callbackData.split(":");
+  const sessionId = parts[1];
+  const projectName = parts[2] || "default";
 
   if (!sessionId || !userId || !chatId) {
-    await ctx.answerCallbackQuery({ text: "ID sessione non valido" });
+    await ctx.answerCallbackQuery({ text: "Invalid session ID" });
     return;
   }
 
+  // Get or create project session
+  const projectSession = await sessionManager.getOrCreateSession(projectName);
+
   // Check if session is already active
-  if (session.isActive) {
-    await ctx.answerCallbackQuery({ text: "Sessione già attiva" });
+  if (projectSession.isActive()) {
+    await ctx.answerCallbackQuery({ text: "Session already active for this project" });
     return;
+  }
+
+  // Switch project if needed
+  const currentProject = sessionManager.getCurrentProject();
+  if (projectName !== currentProject) {
+    const projectPath = resolveProjectPath(projectName);
+    setWorkingDir(projectPath);
+    sessionManager.setCurrentProject(projectName);
+    if (chatId) {
+      sessionManager.setLastUsed(chatId, projectName);
+    }
   }
 
   // Resume the selected session
-  const [success, message] = session.resumeSession(sessionId);
+  const [success, message] = projectSession.session.resumeSession(sessionId);
 
   if (!success) {
     await ctx.answerCallbackQuery({ text: message, show_alert: true });
@@ -185,11 +258,11 @@ async function handleResumeCallback(
 
   // Update the original message to show selection
   try {
-    await ctx.editMessageText(`✅ ${message}`);
+    await ctx.editMessageText(`✅ ${message}\n📁 Project: ${projectName}`);
   } catch (error) {
     console.debug("Failed to edit resume message:", error);
   }
-  await ctx.answerCallbackQuery({ text: "Sessione ripresa!" });
+  await ctx.answerCallbackQuery({ text: "Session resumed!" });
 
   // Send a hidden recap prompt to Claude
   const recapPrompt =
@@ -200,7 +273,7 @@ async function handleResumeCallback(
   const statusCallback = createStatusCallback(ctx, state);
 
   try {
-    await session.sendMessageStreaming(
+    await projectSession.sendMessage(
       recapPrompt,
       username,
       userId,
@@ -214,4 +287,90 @@ async function handleResumeCallback(
   } finally {
     typing.stop();
   }
+}
+
+/**
+ * Handle project callbacks: project:create|clone|cancel:{name}
+ */
+async function handleProjectCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const parts = callbackData.split(":");
+  const action = parts[1]; // create, clone, or cancel
+  const projectName = parts[2]; // project name (may be empty for cancel)
+
+  if (action === "cancel") {
+    try {
+      await ctx.editMessageText("❌ Cancelled.");
+    } catch (error) {
+      console.debug("Failed to edit project callback message:", error);
+    }
+    await ctx.answerCallbackQuery({ text: "Cancelled" });
+    return;
+  }
+
+  if (!projectName) {
+    await ctx.answerCallbackQuery({ text: "Invalid project name", show_alert: true });
+    return;
+  }
+
+  const projectPath = `/home/ubuntu/Projects/${projectName}`;
+
+  if (action === "create") {
+    // Create empty project directory
+    try {
+      const { mkdirSync } = await import("fs");
+      mkdirSync(projectPath, { recursive: true });
+
+      // Switch to the new project
+      setWorkingDir(projectPath);
+      await session.kill();
+
+      await ctx.editMessageText(
+        `✅ <b>Created project:</b> <code>${projectName}</code>\n\n` +
+          `📁 Path: <code>${projectPath}</code>\n\n` +
+          `Session cleared. Next message starts fresh in this project.`,
+        { parse_mode: "HTML" }
+      );
+      await ctx.answerCallbackQuery({ text: "Project created!" });
+    } catch (error) {
+      await ctx.answerCallbackQuery({
+        text: `Failed to create: ${error}`,
+        show_alert: true,
+      });
+    }
+    return;
+  }
+
+  if (action === "clone") {
+    // Ask for the GitHub repo URL/name
+    try {
+      await ctx.editMessageText(
+        `🐙 <b>Clone from GitHub</b>\n\n` +
+          `Send the repository (one of these formats):\n` +
+          `• <code>username/repo</code>\n` +
+          `• <code>https://github.com/username/repo</code>\n\n` +
+          `The repo will be cloned to:\n` +
+          `<code>${projectPath}</code>`,
+        { parse_mode: "HTML" }
+      );
+      await ctx.answerCallbackQuery({ text: "Send the repo name..." });
+
+      // Store pending clone state in session for next message
+      session.pendingClone = {
+        projectName,
+        projectPath,
+        chatId: ctx.chat?.id,
+      };
+    } catch (error) {
+      await ctx.answerCallbackQuery({
+        text: `Error: ${error}`,
+        show_alert: true,
+      });
+    }
+    return;
+  }
+
+  await ctx.answerCallbackQuery({ text: "Unknown action" });
 }

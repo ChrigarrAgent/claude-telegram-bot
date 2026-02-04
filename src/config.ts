@@ -51,11 +51,66 @@ export const WORKING_DIR = process.env.CLAUDE_WORKING_DIR || HOME; // Initial va
 // Project aliases for quick switching
 export const PROJECT_ALIASES: Record<string, string> = {
   "home": HOME,
-  "aegir": "/home/ubuntu/.openclaw/workspace/aegir",
+  "aegir": "/home/ubuntu/Projects/aegir",
   "openclaw": "/home/ubuntu/.openclaw/workspace",
   "projects": "/home/ubuntu/Projects",
   "telegram-bot": "/home/ubuntu/Projects/claude-telegram-bot",
 };
+
+/**
+ * Resolve project name to full path.
+ * Resolution order:
+ * 1. PROJECT_ALIASES map
+ * 2. /home/ubuntu/Projects/{name}
+ * 3. /home/ubuntu/.openclaw/workspace/{name}
+ * 4. Absolute path (if starts with / or ~)
+ */
+export function resolveProjectPath(projectName: string): string {
+  // Check aliases first
+  if (PROJECT_ALIASES[projectName]) {
+    return PROJECT_ALIASES[projectName]!;
+  }
+
+  // Absolute path
+  if (projectName.startsWith("/") || projectName.startsWith("~")) {
+    return projectName.replace(/^~/, HOME);
+  }
+
+  // Try common locations
+  const candidates = [
+    `${HOME}/Projects/${projectName}`,
+    `${HOME}/.openclaw/workspace/${projectName}`,
+    `${HOME}/${projectName}`,
+  ];
+
+  // Use existsSync to check if directory exists
+  try {
+    const { existsSync, statSync } = require("fs");
+    const found = candidates.find((p) => {
+      try {
+        return existsSync(p) && statSync(p).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+    if (found) return found;
+  } catch {
+    // If fs check fails, return first candidate
+  }
+
+  // Default to first candidate
+  return candidates[0]!;
+}
+
+/**
+ * Project header display configuration.
+ * - always: Show project header on every message
+ * - never: Never show project headers
+ * - multiple: Show only when multiple sessions active
+ */
+export const SHOW_PROJECT_HEADERS: "always" | "never" | "multiple" =
+  (process.env.SHOW_PROJECT_HEADERS as any) || "always";
+
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 export const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 

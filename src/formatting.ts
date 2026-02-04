@@ -16,6 +16,66 @@ export function escapeHtml(text: string): string {
 }
 
 /**
+ * Convert a Markdown table to a formatted monospace table.
+ */
+function convertMarkdownTable(tableText: string): string {
+  const lines = tableText.trim().split("\n");
+  if (lines.length < 2) return tableText;
+
+  // Parse rows (skip separator line with dashes)
+  const rows: string[][] = [];
+  for (const line of lines) {
+    // Skip separator lines (|---|---|)
+    if (/^\|?\s*[-:]+\s*\|/.test(line)) continue;
+
+    const cells = line
+      .split("|")
+      .map(c => c.trim())
+      .filter((c, i, arr) => i > 0 || c !== ""); // Remove empty first cell from leading |
+
+    // Remove empty last cell from trailing |
+    if (cells.length > 0 && cells[cells.length - 1] === "") {
+      cells.pop();
+    }
+
+    if (cells.length > 0) {
+      rows.push(cells);
+    }
+  }
+
+  if (rows.length === 0) return tableText;
+
+  // Calculate column widths
+  const colWidths: number[] = [];
+  for (const row of rows) {
+    for (let i = 0; i < row.length; i++) {
+      colWidths[i] = Math.max(colWidths[i] || 0, row[i]!.length);
+    }
+  }
+
+  // Build formatted table
+  const output: string[] = [];
+  const separator = "─".repeat(colWidths.reduce((a, b) => a + b, 0) + colWidths.length * 3 + 1);
+
+  output.push(separator);
+
+  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const row = rows[rowIdx]!;
+    const formattedCells = row.map((cell, i) => cell.padEnd(colWidths[i] || 0));
+    output.push("│ " + formattedCells.join(" │ ") + " │");
+
+    // Add separator after header row
+    if (rowIdx === 0 && rows.length > 1) {
+      output.push(separator);
+    }
+  }
+
+  output.push(separator);
+
+  return "<pre>" + output.join("\n") + "</pre>";
+}
+
+/**
  * Convert standard markdown to Telegram-compatible HTML.
  *
  * HTML is more reliable than Telegram's Markdown which breaks on special chars.
@@ -25,6 +85,7 @@ export function convertMarkdownToHtml(text: string): string {
   // Store code blocks temporarily to avoid processing their contents
   const codeBlocks: string[] = [];
   const inlineCodes: string[] = [];
+  const tables: string[] = [];
 
   // Save code blocks first (```code```)
   text = text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => {
@@ -36,6 +97,12 @@ export function convertMarkdownToHtml(text: string): string {
   text = text.replace(/`([^`]+)`/g, (_, code) => {
     inlineCodes.push(code);
     return `\x00INLINECODE${inlineCodes.length - 1}\x00`;
+  });
+
+  // Detect and save Markdown tables (lines starting with |)
+  text = text.replace(/((?:^\|.+\|$\n?)+)/gm, (match) => {
+    tables.push(match);
+    return `\x00TABLE${tables.length - 1}\x00`;
   });
 
   // Escape HTML entities in the remaining text
@@ -67,6 +134,12 @@ export function convertMarkdownToHtml(text: string): string {
 
   // Links: [text](url) -> <a href="url">text</a>
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  // Restore tables with formatting
+  for (let i = 0; i < tables.length; i++) {
+    const formattedTable = convertMarkdownTable(tables[i]!);
+    text = text.replace(`\x00TABLE${i}\x00`, formattedTable);
+  }
 
   // Restore code blocks
   for (let i = 0; i < codeBlocks.length; i++) {

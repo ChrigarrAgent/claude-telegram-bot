@@ -7,6 +7,7 @@
 import { Bot } from "grammy";
 import { run, sequentialize } from "@grammyjs/runner";
 import { TELEGRAM_TOKEN, WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "./config";
+import { sessionManager } from "./session-manager";
 import { unlinkSync, readFileSync, existsSync } from "fs";
 import {
   handleStart,
@@ -19,6 +20,8 @@ import {
   handleHandoff,
   handleTmux,
   handleProject,
+  handleProjects,
+  handleUsage,
   handleText,
   handleVoice,
   handlePhoto,
@@ -29,15 +32,30 @@ import {
 // Create bot instance
 const bot = new Bot(TELEGRAM_TOKEN);
 
-// Sequentialize non-command messages per user (prevents race conditions)
-// Commands bypass sequentialization so they work immediately
+// Treat slash commands from forwarded messages as regular text (security: don't execute /restart from forwards)
+bot.use(async (ctx, next) => {
+  const msg = ctx.message;
+  if (msg?.text?.startsWith("/")) {
+    // Check if message is forwarded
+    const isForwarded = !!(msg.forward_origin || msg.forward_from || msg.forward_from_chat || msg.forward_date);
+    if (isForwarded) {
+      // Treat forwarded commands as regular text - send directly to text handler
+      await handleText(ctx);
+      return; // Don't continue to command handlers
+    }
+  }
+  await next();
+});
+
+// Sequentialize non-command messages per (chat, project) to prevent race conditions
+// This allows concurrent execution across projects while preventing races within same project
 bot.use(
   sequentialize((ctx) => {
     // Commands are not sequentialized - they work immediately
     if (ctx.message?.text?.startsWith("/")) {
       return undefined;
     }
-    // Messages with ! prefix bypass queue (interrupt)
+    // Messages with ! prefix bypass queue (interrupt current project query)
     if (ctx.message?.text?.startsWith("!")) {
       return undefined;
     }
@@ -45,8 +63,17 @@ bot.use(
     if (ctx.callbackQuery) {
       return undefined;
     }
-    // Other messages are sequentialized per chat
-    return ctx.chat?.id.toString();
+
+    // Queue per (chatId, projectName) tuple
+    // This allows different projects to run concurrently while preventing
+    // race conditions within the same project
+    const chatId = ctx.chat?.id;
+    if (!chatId) return undefined;
+
+    // Get last-used project for this chat (defaults to 'default' if none)
+    const projectName = sessionManager.getLastUsed(chatId) || 'default';
+
+    return `${chatId}:${projectName}`;
   })
 );
 
@@ -62,6 +89,8 @@ bot.command("retry", handleRetry);
 bot.command("handoff", handleHandoff);
 bot.command("tmux", handleTmux);
 bot.command("project", handleProject);
+bot.command("projects", handleProjects);
+bot.command("usage", handleUsage);
 
 // ============== Message Handlers ==============
 
