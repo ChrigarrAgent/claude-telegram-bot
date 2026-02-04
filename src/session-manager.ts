@@ -35,6 +35,7 @@ class SessionManager {
   private sessions = new Map<string, ProjectSession>();
   private creationLocks = new Map<string, Promise<ProjectSession>>();
   private lastUsedPerChat = new Map<number, string>();
+  private chatsByProject = new Map<string, Set<number>>(); // Reverse index for O(1) lookup
   private pendingClonePerChat = new Map<number, PendingClone>();
   private currentProject: string = "default";
 
@@ -67,11 +68,27 @@ class SessionManager {
 
   /**
    * Internal session creation (imported dynamically to avoid circular deps).
+   * Automatically resumes persisted session if one exists for this project.
    */
   private async _createSession(projectName: string): Promise<ProjectSession> {
     const { ProjectSession: PS } = await import("./project-session");
     const workingDir = resolveProjectPath(projectName);
     const claudeSession = new ClaudeSession();
+
+    // CRITICAL: Auto-resume persisted session for this project
+    // This ensures continuity when bot restarts or sessions are recreated
+    const savedSessions = claudeSession.getSessionList(projectName);
+    if (savedSessions.length > 0) {
+      const mostRecent = savedSessions[0]!;
+      // Only resume if it's for the same working directory
+      if (mostRecent.working_dir === workingDir || mostRecent.project === projectName) {
+        claudeSession.sessionId = mostRecent.session_id;
+        claudeSession.conversationTitle = mostRecent.title;
+        claudeSession["_resumeAttempted"] = true; // Track for validation on first message
+        console.log(`Auto-resumed session for ${projectName}: ${mostRecent.session_id.slice(0, 8)}...`);
+      }
+    }
+
     return new PS(projectName, workingDir, claudeSession);
   }
 
@@ -105,8 +122,22 @@ class SessionManager {
 
   /**
    * Track last-used project for a chat.
+   * Maintains reverse index for O(1) lookup of chats by project.
    */
   setLastUsed(chatId: number, projectName: string): void {
+    // Remove from old project's chat set (if different)
+    const oldProject = this.lastUsedPerChat.get(chatId);
+    if (oldProject && oldProject !== projectName) {
+      this.chatsByProject.get(oldProject)?.delete(chatId);
+    }
+
+    // Add to new project's chat set
+    if (!this.chatsByProject.has(projectName)) {
+      this.chatsByProject.set(projectName, new Set());
+    }
+    this.chatsByProject.get(projectName)!.add(chatId);
+
+    // Update primary mapping
     this.lastUsedPerChat.set(chatId, projectName);
     this.currentProject = projectName;
   }
@@ -120,15 +151,11 @@ class SessionManager {
 
   /**
    * Get all chat IDs that are using a specific project.
+   * Uses reverse index for O(1) lookup.
    */
   getChatIdsForProject(projectName: string): number[] {
-    const chatIds: number[] = [];
-    for (const [chatId, project] of this.lastUsedPerChat.entries()) {
-      if (project === projectName) {
-        chatIds.push(chatId);
-      }
-    }
-    return chatIds;
+    const chatSet = this.chatsByProject.get(projectName);
+    return chatSet ? Array.from(chatSet) : [];
   }
 
   /**
@@ -214,6 +241,7 @@ export function resetSessionManager(): void {
   sessionManager["sessions"].clear();
   sessionManager["creationLocks"].clear();
   sessionManager["lastUsedPerChat"].clear();
+  sessionManager["chatsByProject"].clear();
   sessionManager["pendingClonePerChat"].clear();
   sessionManager["currentProject"] = "default";
 }

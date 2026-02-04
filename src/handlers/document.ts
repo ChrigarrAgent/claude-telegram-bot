@@ -6,12 +6,12 @@
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
+import { basename, extname } from "path";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
-import { StreamingState, createStatusCallback } from "./streaming";
 import { createMediaGroupBuffer, handleProcessingError } from "./media-group";
+import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 // Supported text file extensions
 const TEXT_EXTENSIONS = [
@@ -53,6 +53,7 @@ const documentBuffer = createMediaGroupBuffer({
 
 /**
  * Download a document and return the local path.
+ * Uses secure path handling to prevent path traversal attacks.
  */
 async function downloadDocument(ctx: Context): Promise<string> {
   const doc = ctx.message?.document;
@@ -61,11 +62,24 @@ async function downloadDocument(ctx: Context): Promise<string> {
   }
 
   const file = await ctx.getFile();
-  const fileName = doc.file_name || `doc_${Date.now()}`;
+  const originalName = doc.file_name || `doc_${Date.now()}`;
 
-  // Sanitize filename
-  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const docPath = `${TEMP_DIR}/${safeName}`;
+  // SECURE: Use basename to strip any directory components (prevents path traversal)
+  const baseName = basename(originalName);
+  const ext = extname(baseName);
+  const nameWithoutExt = ext ? baseName.slice(0, -ext.length) : baseName;
+
+  // Sanitize the name part and limit length
+  let safeName = nameWithoutExt
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 50);
+
+  // Ensure we have a valid name
+  if (!safeName || safeName === "." || safeName === "..") {
+    safeName = `doc_${Date.now()}`;
+  }
+
+  const docPath = `${TEMP_DIR}/${safeName}${ext}`;
 
   // Download
   const response = await fetch(
@@ -216,7 +230,8 @@ async function processArchive(
   username: string,
   chatId: number
 ): Promise<void> {
-  const stopProcessing = session.startProcessing();
+  const projectSession = await getSessionForChat(chatId);
+  const stopProcessing = projectSession.session.startProcessing();
   const typing = startTypingIndicator(ctx);
 
   // Show extraction progress
@@ -224,10 +239,12 @@ async function processArchive(
     parse_mode: "HTML",
   });
 
+  let extractDir: string | null = null;
+
   try {
     // Extract archive
     console.log(`Extracting archive: ${fileName}`);
-    const extractDir = await extractArchive(archivePath, fileName);
+    extractDir = await extractArchive(archivePath, fileName);
     const { tree, contents } = await extractArchiveContent(extractDir);
     console.log(`Extracted: ${tree.length} files, ${contents.length} readable`);
 
@@ -251,25 +268,24 @@ async function processArchive(
       : `Please analyze this archive (${fileName}):\n\nFile tree (${tree.length} files):\n${treeStr}\n\nExtracted contents:\n${contentsStr}`;
 
     // Set conversation title (if new session)
-    if (!session.isActive) {
+    if (!projectSession.isActive()) {
       const rawTitle = caption || `[Archivio: ${fileName}]`;
       const title =
         rawTitle.length > 50 ? rawTitle.slice(0, 47) + "..." : rawTitle;
-      session.conversationTitle = title;
+      projectSession.session.conversationTitle = title;
     }
 
-    // Create streaming state
-    const state = new StreamingState();
-    const statusCallback = createStatusCallback(ctx, state);
-
-    const response = await session.sendMessageStreaming(
+    // Send with retry logic
+    const { response } = await sendMessageWithRetry(
+      projectSession,
       prompt,
       username,
       userId,
-      statusCallback,
-      chatId,
-      ctx
+      ctx,
+      chatId
     );
+
+    projectSession.updateActivity();
 
     await auditLog(
       userId,
@@ -278,9 +294,6 @@ async function processArchive(
       `[${fileName}] ${caption || ""}`,
       response
     );
-
-    // Cleanup
-    await Bun.$`rm -rf ${extractDir}`.quiet();
 
     // Delete status message
     try {
@@ -300,6 +313,14 @@ async function processArchive(
       `❌ Failed to process archive: ${String(error).slice(0, 100)}`
     );
   } finally {
+    // Cleanup extract directory
+    if (extractDir) {
+      try {
+        await Bun.$`rm -rf ${extractDir}`.quiet();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
     stopProcessing();
     typing.stop();
   }
@@ -316,8 +337,9 @@ async function processDocuments(
   username: string,
   chatId: number
 ): Promise<void> {
-  // Mark processing started
-  const stopProcessing = session.startProcessing();
+  const projectSession = await getSessionForChat(chatId);
+  const stopProcessing = projectSession.session.startProcessing();
+  const typing = startTypingIndicator(ctx);
 
   // Build prompt
   let prompt: string;
@@ -336,30 +358,25 @@ async function processDocuments(
   }
 
   // Set conversation title (if new session)
-  if (!session.isActive) {
+  if (!projectSession.isActive()) {
     const docName = documents[0]?.name || "[Documento]";
     const rawTitle = caption || `[Documento: ${docName}]`;
     const title =
       rawTitle.length > 50 ? rawTitle.slice(0, 47) + "..." : rawTitle;
-    session.conversationTitle = title;
+    projectSession.session.conversationTitle = title;
   }
 
-  // Start typing
-  const typing = startTypingIndicator(ctx);
-
-  // Create streaming state
-  const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
-
   try {
-    const response = await session.sendMessageStreaming(
+    const { response, state } = await sendMessageWithRetry(
+      projectSession,
       prompt,
       username,
       userId,
-      statusCallback,
-      chatId,
-      ctx
+      ctx,
+      chatId
     );
+
+    projectSession.updateActivity();
 
     await auditLog(
       userId,
@@ -369,7 +386,7 @@ async function processDocuments(
       response
     );
   } catch (error) {
-    await handleProcessingError(ctx, error, state.toolMessages);
+    await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
     typing.stop();

@@ -14,6 +14,7 @@ import { readFileSync } from "fs";
 import type { Context } from "grammy";
 import {
   ALLOWED_PATHS,
+  CLAUDE_CLI_PATH,
   MCP_SERVERS,
   QUERY_TIMEOUT_MS,
   SAFETY_PROMPT,
@@ -98,6 +99,7 @@ export class ClaudeSession {
   private stopRequested = false;
   private _isProcessing = false;
   private _wasInterruptedByNewMessage = false;
+  private _resumeAttempted = false; // Track if we tried to resume from disk
 
   get isActive(): boolean {
     return this.sessionId !== null;
@@ -226,9 +228,11 @@ export class ClaudeSession {
       resume: this.sessionId || undefined,
     };
 
-    // Add Claude Code executable path if set (required for standalone builds)
-    if (process.env.CLAUDE_CODE_PATH) {
-      options.pathToClaudeCodeExecutable = process.env.CLAUDE_CODE_PATH;
+    // Add Claude Code executable path - use config or env
+    const claudePath = process.env.CLAUDE_CODE_PATH || CLAUDE_CLI_PATH;
+    if (claudePath) {
+      options.pathToClaudeCodeExecutable = claudePath;
+      console.log(`DEBUG: Claude CLI path: ${claudePath}`);
     }
 
     if (this.sessionId && !isNewSession) {
@@ -286,19 +290,40 @@ export class ClaudeSession {
 
     try {
       // Use V1 query() API - supports all options including cwd, mcpServers, etc.
-      const queryInstance = query({
-        prompt: messageToSend,
-        options: {
-          ...options,
-          abortController: this.abortController,
-        },
-      });
+      console.log("DEBUG: Creating query instance...");
+      console.log("DEBUG: Options:", JSON.stringify({
+        model: options.model,
+        cwd: options.cwd,
+        resume: options.resume,
+        maxThinkingTokens: options.maxThinkingTokens,
+      }));
+
+      let queryInstance;
+      try {
+        queryInstance = query({
+          prompt: messageToSend,
+          options: {
+            ...options,
+            abortController: this.abortController,
+          },
+        });
+        console.log("DEBUG: Query instance created successfully");
+      } catch (queryError) {
+        console.error("DEBUG: Error creating query instance:", queryError);
+        throw queryError;
+      }
 
       // Start activity timeout
       resetActivityTimeout();
 
+      console.log("DEBUG: Starting event loop...");
+      let eventCount = 0;
+
       // Process streaming response
       for await (const event of queryInstance) {
+        eventCount++;
+        console.log(`DEBUG: Event ${eventCount}: type=${event.type}`);
+
         // Reset timeout on any activity
         resetActivityTimeout();
 
@@ -311,8 +336,12 @@ export class ClaudeSession {
         // Capture session_id from first message
         if (!this.sessionId && event.session_id) {
           this.sessionId = event.session_id;
+          this._resumeAttempted = false; // Session validated successfully
           console.log(`GOT session_id: ${this.sessionId!.slice(0, 8)}...`);
           this.saveSession();
+        } else if (this.sessionId && this._resumeAttempted) {
+          // Resume was successful - got events with existing session_id
+          this._resumeAttempted = false;
         }
 
         // Handle different message types
@@ -492,11 +521,31 @@ export class ClaudeSession {
         }
       }
 
+      console.log(`DEBUG: Event loop finished. Total events: ${eventCount}, completed: ${queryCompleted}`);
+
       // V1 query completes automatically when the generator ends
     } catch (error) {
       const errorStr = String(error).toLowerCase();
       const isCleanupError =
         errorStr.includes("cancel") || errorStr.includes("abort");
+
+      // Check if this was a resume failure (session not found, invalid, expired)
+      const isResumeFailure =
+        this._resumeAttempted &&
+        (errorStr.includes("session") ||
+          errorStr.includes("not found") ||
+          errorStr.includes("invalid") ||
+          errorStr.includes("expired"));
+
+      if (isResumeFailure) {
+        console.warn(`Resume failed, will start fresh session: ${error}`);
+        // Clear the failed session so next attempt starts fresh
+        this.sessionId = null;
+        this._resumeAttempted = false;
+        this.lastError = "Resume failed - starting fresh session";
+        this.lastErrorTime = new Date();
+        throw new Error("Session resume failed - please retry");
+      }
 
       if (
         isCleanupError &&

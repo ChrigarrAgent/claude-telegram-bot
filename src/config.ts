@@ -90,11 +90,12 @@ export function resolveProjectPath(projectName: string): string {
     });
     if (found) return found;
   } catch {
-    // If fs check fails, return first candidate
+    // If fs check fails, fall through to default
   }
 
-  // Default to first candidate
-  return candidates[0]!;
+  // If project not found, fall back to HOME directory (don't return non-existent path)
+  // This handles cases like project name "ubuntu" extracted from "/home/ubuntu"
+  return HOME;
 }
 
 /**

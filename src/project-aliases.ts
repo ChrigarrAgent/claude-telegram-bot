@@ -4,7 +4,7 @@
  * Auto-generates and persists project aliases (lowercase, human-friendly names).
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { homedir } from "os";
 
 const HOME = homedir();
@@ -21,13 +21,8 @@ interface ReverseMapping {
 let aliasCache: AliasMapping | null = null;
 let reverseCache: ReverseMapping | null = null;
 
-/**
- * Project scan directories - these are scanned on startup for auto-alias generation.
- */
-const PROJECT_SCAN_DIRS = [
-  `${HOME}/Projects`,
-  `${HOME}/.openclaw/workspace`,
-];
+// NOTE: We no longer auto-scan directories.
+// Projects are added when explicitly used via /project, @project, or when first messaged.
 
 /**
  * Load aliases from disk (cached).
@@ -202,11 +197,18 @@ export function removeProjectAlias(projectPath: string): void {
 
 /**
  * Reverse lookup: get project path by alias.
- * Returns null if alias not found.
+ * Returns null if alias not found or if path doesn't exist.
  */
 export function getProjectByAlias(alias: string): string | null {
   const reverse = buildReverseMapping();
-  return reverse[alias.toLowerCase()] || null;
+  const path = reverse[alias.toLowerCase()];
+
+  // Validate that the path actually exists
+  if (path && existsSync(path)) {
+    return path;
+  }
+
+  return null;
 }
 
 /**
@@ -217,70 +219,37 @@ export function loadProjectAliases(): AliasMapping {
 }
 
 /**
- * Scan directories and generate aliases for all projects.
- * Called on startup to auto-discover projects.
+ * Validate existing aliases - remove entries for non-existent paths.
+ * Called on startup to clean up stale aliases.
+ *
+ * NOTE: We no longer auto-scan directories to add projects.
+ * Projects are only added when explicitly used via /project or @project syntax.
  */
 export async function scanAndGenerateAliases(): Promise<void> {
   const aliases = loadAliases();
-  const existingAliases = new Set(Object.values(aliases));
 
-  // Add special aliases
+  // Ensure HOME always has an alias
   if (!aliases[HOME]) {
     aliases[HOME] = "home";
-    existingAliases.add("home");
   }
 
-  // Scan each project directory
-  for (const scanDir of PROJECT_SCAN_DIRS) {
-    if (!existsSync(scanDir)) {
-      continue;
-    }
-
-    try {
-      const entries = readdirSync(scanDir);
-
-      for (const entry of entries) {
-        // Skip hidden directories
-        if (entry.startsWith(".")) {
-          continue;
-        }
-
-        const fullPath = `${scanDir}/${entry}`;
-
-        try {
-          const stat = statSync(fullPath);
-          if (!stat.isDirectory()) {
-            continue;
-          }
-
-          // Skip if already has an alias
-          if (aliases[fullPath]) {
-            continue;
-          }
-
-          // Generate alias
-          let alias = generateAlias(fullPath);
-
-          // Handle conflicts
-          let finalAlias = alias;
-          let counter = 1;
-          while (existingAliases.has(finalAlias)) {
-            counter++;
-            finalAlias = `${alias}-${counter}`;
-          }
-
-          aliases[fullPath] = finalAlias;
-          existingAliases.add(finalAlias);
-        } catch {
-          // Skip directories we can't access
-        }
-      }
-    } catch {
-      // Skip scan directories we can't read
+  // Remove aliases for paths that no longer exist
+  const pathsToRemove: string[] = [];
+  for (const path of Object.keys(aliases)) {
+    if (!existsSync(path)) {
+      console.log(`Removing stale alias for non-existent path: ${path}`);
+      pathsToRemove.push(path);
     }
   }
 
-  saveAliases(aliases);
+  for (const path of pathsToRemove) {
+    delete aliases[path];
+  }
+
+  if (pathsToRemove.length > 0) {
+    saveAliases(aliases);
+  }
+
   console.log(`Project aliases: ${Object.keys(aliases).length} projects`);
 }
 

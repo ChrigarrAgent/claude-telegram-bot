@@ -7,7 +7,7 @@
 import type { Context } from "grammy";
 import type { Message } from "grammy/types";
 import { InlineKeyboard } from "grammy";
-import type { StatusCallback } from "../types";
+import type { StatusCallback, StatusType } from "../types";
 import { convertMarkdownToHtml, escapeHtml } from "../formatting";
 import {
   TELEGRAM_MESSAGE_LIMIT,
@@ -96,7 +96,7 @@ export function createStatusCallback(
   ctx: Context,
   state: StreamingState
 ): StatusCallback {
-  return async (statusType: string, content: string, segmentId?: number) => {
+  return async (statusType: StatusType, content: string, segmentId?: number) => {
     try {
       if (statusType === "thinking") {
         // Show thinking inline, compact (first 500 chars)

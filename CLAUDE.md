@@ -24,8 +24,11 @@ Telegram message → Handler → Auth check → Rate limit → Claude session �
 ### Key Modules
 
 - **`src/index.ts`** - Entry point, registers handlers, starts polling
-- **`src/config.ts`** - Environment parsing, MCP loading, safety prompts
-- **`src/session.ts`** - `ClaudeSession` class wrapping Agent SDK V2 with streaming, session persistence (`/tmp/claude-telegram-session.json`), and defense-in-depth safety checks
+- **`src/config.ts`** - Environment parsing, MCP loading, safety prompts, `resolveProjectPath()`
+- **`src/session.ts`** - `ClaudeSession` class wrapping Agent SDK with streaming and session persistence
+- **`src/session-manager.ts`** - `SessionManager` singleton coordinating multi-project sessions
+- **`src/project-session.ts`** - `ProjectSession` wrapping `ClaudeSession` with project context
+- **`src/project-aliases.ts`** - Human-friendly project names (`~/.claude/telegram-project-aliases.json`)
 - **`src/security.ts`** - `RateLimiter` (token bucket), path validation, command safety checks
 - **`src/formatting.ts`** - Markdown→HTML conversion for Telegram, tool status emoji formatting
 - **`src/utils.ts`** - Audit logging, voice transcription (OpenAI), typing indicators
@@ -113,4 +116,203 @@ launchctl load ~/Library/LaunchAgents/com.claude-telegram-ts.plist
 # Logs
 tail -f /tmp/claude-telegram-bot-ts.log
 tail -f /tmp/claude-telegram-bot-ts.err
+```
+
+## Multi-Project System
+
+The bot supports multiple concurrent projects with session isolation:
+
+### Key Components
+
+- **`src/session-manager.ts`** - `SessionManager` class coordinates `ProjectSession` instances
+- **`src/project-session.ts`** - Wraps `ClaudeSession` with project-specific context
+- **`src/project-aliases.ts`** - Manages human-friendly project names (stored in `~/.claude/telegram-project-aliases.json`)
+
+### Session Routing
+
+1. Each chat tracks its last-used project via `sessionManager.setLastUsed(chatId, projectName)`
+2. Messages route to the project session, not a global session
+3. Sessions auto-resume from persisted state when recreated
+
+### Project Aliases
+
+- Projects are only added when explicitly used (via `/project`, `@project` syntax, or first message)
+- No auto-scanning of directories on startup
+- Alias file validates paths exist before returning them
+
+### Commands
+
+- `/projects` - Lists all projects with inline keyboard buttons
+- `/project <name>` - Switches to project (creates if doesn't exist)
+- `@projectname message` - Routes message to specific project
+
+## Known Issues & Solutions
+
+### Issue: SDK fails silently with non-existent cwd
+
+**Symptom**: No events received from `query()`, bot shows project header but no response
+
+**Cause**: The Claude Agent SDK's `query()` function fails silently when `cwd` points to a non-existent directory
+
+**Fix**:
+1. Validate paths exist in `getProjectByAlias()` before returning them
+2. `resolveProjectPath()` falls back to HOME instead of non-existent paths
+3. Add debug logging: `console.log("DEBUG: Options:", JSON.stringify({cwd: options.cwd, ...}))`
+
+### Issue: Session not resuming when replying to messages
+
+**Symptom**: Bot creates new session instead of continuing conversation
+
+**Cause**: When `_createSession()` creates a new `ClaudeSession`, it didn't load persisted session IDs
+
+**Fix**: In `session-manager.ts`, auto-resume persisted session when creating ProjectSession:
+```typescript
+const savedSessions = claudeSession.getSessionList(projectName);
+if (savedSessions.length > 0) {
+  claudeSession.sessionId = mostRecent.session_id;
+}
+```
+
+### Issue: Claude Code process exits with code 1
+
+**Symptom**: `Error: Claude Code process exited with code 1` for voice/photo/document
+
+**Cause**: Transient Claude Code CLI crashes
+
+**Fix**: All handlers now have retry logic with `MAX_RETRIES = 1`:
+```typescript
+if (errorStr.includes("exited with code") && attempt < MAX_RETRIES) {
+  await projectSession.kill(); // Clear corrupted session
+  await ctx.reply(`⚠️ Claude crashed, retrying...`);
+  continue;
+}
+```
+
+### Issue: 409 Conflict errors
+
+**Symptom**: `GrammyError: 409: Conflict: terminated by other getUpdates request`
+
+**Cause**: Multiple bot instances running simultaneously
+
+**Fix**: Kill all stray processes before starting:
+```bash
+pm2 kill
+pkill -f "bun.*claude-telegram-bot"
+pm2 start ecosystem.config.js
+```
+
+## Debugging Tips
+
+### Debug Logging for SDK Issues
+
+When the bot isn't responding, add debug logging around the SDK query:
+
+```typescript
+console.log("DEBUG: Creating query instance...");
+console.log("DEBUG: Options:", JSON.stringify({
+  model: options.model,
+  cwd: options.cwd,  // CRITICAL: verify this path exists!
+  resume: options.resume,
+}));
+
+let eventCount = 0;
+for await (const event of queryInstance) {
+  eventCount++;
+  console.log(`DEBUG: Event ${eventCount}: type=${event.type}`);
+  // ...
+}
+console.log(`DEBUG: Event loop finished. Total events: ${eventCount}`);
+```
+
+If `eventCount` stays at 0, the SDK is failing silently - check the `cwd` path.
+
+### Checking Bot Logs
+
+```bash
+# Live logs
+pm2 logs claude-telegram-bot
+
+# Recent logs without streaming
+pm2 logs claude-telegram-bot --lines 50 --nostream
+
+# Search for specific errors
+pm2 logs claude-telegram-bot --lines 200 --nostream 2>&1 | grep -E "Error|error|DEBUG"
+```
+
+### Handler Consistency
+
+**IMPORTANT**: All message handlers (text, voice, photo, document) must use `sessionManager` for multi-project support. The global `session` export exists only for legacy compatibility.
+
+```typescript
+// CORRECT - use sessionManager
+const projectSession = await sessionManager.getOrCreateSession(projectName);
+await projectSession.sendMessage(message, ...);
+
+// WRONG - bypasses multi-project routing
+await session.sendMessageStreaming(message, ...);
+```
+
+### Path Validation Pattern
+
+Always validate paths before passing to the SDK:
+
+```typescript
+import { existsSync } from "fs";
+
+// In getProjectByAlias()
+if (path && existsSync(path)) {
+  return path;
+}
+return null;  // Don't return non-existent paths
+
+// In resolveProjectPath()
+if (!existsSync(resolved)) {
+  return HOME;  // Fallback to safe default
+}
+```
+
+### Testing Session Resume
+
+To verify session resume is working:
+
+1. Send a message and note the session ID in logs: `GOT session_id: abc123...`
+2. Restart the bot: `pm2 restart claude-telegram-bot`
+3. Send another message to the same project
+4. Check logs for: `Auto-resumed session for <project>: abc123...`
+
+If you see `STARTING new Claude session` instead of `Auto-resumed`, the resume logic isn't working.
+
+## Running on Ubuntu Server (PM2)
+
+```bash
+# Start with PM2
+pm2 start ecosystem.config.js
+
+# Or directly
+pm2 start "bun run start" --name claude-telegram-bot
+
+# View status
+pm2 status
+
+# Restart after code changes
+pm2 restart claude-telegram-bot
+
+# Stop
+pm2 stop claude-telegram-bot
+```
+
+### ecosystem.config.js
+
+```javascript
+module.exports = {
+  apps: [{
+    name: 'claude-telegram-bot',
+    script: 'bun',
+    args: 'run start',
+    cwd: '/home/ubuntu/Projects/claude-telegram-bot',
+    env: {
+      NODE_ENV: 'production',
+    },
+  }],
+};
 ```

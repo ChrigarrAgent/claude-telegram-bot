@@ -6,8 +6,7 @@ import type { Context } from "grammy";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { sessionManager } from "../session-manager";
-import type { ProjectSession } from "../project-session";
-import { ALLOWED_USERS, setWorkingDir, SHOW_PROJECT_HEADERS, getWorkingDir, resolveProjectPath } from "../config";
+import { ALLOWED_USERS, setWorkingDir, SHOW_PROJECT_HEADERS, getWorkingDir } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import {
   auditLog,
@@ -15,8 +14,8 @@ import {
   checkInterrupt,
   startTypingIndicator,
 } from "../utils";
-import { StreamingState, createStatusCallback } from "./streaming";
 import { getProjectAlias, getProjectByAlias } from "../project-aliases";
+import { getProjectNameForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 const execAsync = promisify(exec);
 
@@ -226,12 +225,7 @@ export async function handleText(ctx: Context): Promise<void> {
   }
 
   // 1.5. Determine target project (from @-syntax, last-used, or default)
-  const projectName = targetProjectFromAtSyntax || sessionManager.getLastUsed(chatId) || (() => {
-    // Extract project name from current working directory
-    const workDir = getWorkingDir();
-    const pathParts = workDir.split("/");
-    return pathParts[pathParts.length - 1] || "default";
-  })();
+  const projectName = targetProjectFromAtSyntax || getProjectNameForChat(chatId);
 
   // Get or create project session
   const projectSession = await sessionManager.getOrCreateSession(projectName);
@@ -295,74 +289,28 @@ export async function handleText(ctx: Context): Promise<void> {
   // 8. Start typing indicator
   const typing = startTypingIndicator(ctx);
 
-  // 9. Create streaming state and callback
-  let state = new StreamingState();
-  let statusCallback = createStatusCallback(ctx, state);
+  try {
+    // 9. Send to Claude with retry logic
+    const { response } = await sendMessageWithRetry(
+      projectSession,
+      message,
+      username,
+      userId,
+      ctx,
+      chatId
+    );
 
-  // 10. Send to Claude with retry logic for crashes
-  const MAX_RETRIES = 1;
+    // 10. Update project activity (lastUsed already set above)
+    projectSession.updateActivity();
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const response = await projectSession.sendMessage(
-        message,
-        username,
-        userId,
-        statusCallback,
-        chatId,
-        ctx
-      );
-
-      // 11. Update project activity (lastUsed already set above)
-      projectSession.updateActivity();
-
-      // 12. Audit log
-      await auditLog(userId, username, "TEXT", message, response);
-      break; // Success - exit retry loop
-    } catch (error) {
-      const errorStr = String(error);
-      const isClaudeCodeCrash = errorStr.includes("exited with code");
-
-      // Clean up any partial messages from this attempt
-      for (const toolMsg of state.toolMessages) {
-        try {
-          await ctx.api.deleteMessage(toolMsg.chat.id, toolMsg.message_id);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
-
-      // Retry on Claude Code crash (not user cancellation)
-      if (isClaudeCodeCrash && attempt < MAX_RETRIES) {
-        console.log(
-          `Claude Code crashed for ${projectName}, retrying (attempt ${attempt + 2}/${MAX_RETRIES + 1})...`
-        );
-        await projectSession.kill(); // Clear corrupted session
-        await ctx.reply(`⚠️ Claude crashed, retrying...`);
-        // Reset state for retry
-        state = new StreamingState();
-        statusCallback = createStatusCallback(ctx, state);
-        continue;
-      }
-
-      // Final attempt failed or non-retryable error
-      console.error(`Error processing message for ${projectName}:`, error);
-
-      // Check if it was a cancellation
-      if (errorStr.includes("abort") || errorStr.includes("cancel")) {
-        // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
-        const wasInterrupt = projectSession.session.consumeInterruptFlag();
-        if (!wasInterrupt) {
-          await ctx.reply("🛑 Query stopped.");
-        }
-      } else {
-        await ctx.reply(`❌ Error: ${errorStr.slice(0, 200)}`);
-      }
-      break; // Exit loop after handling error
-    }
+    // 11. Audit log
+    await auditLog(userId, username, "TEXT", message, response);
+  } catch (error) {
+    console.error(`Error processing message for ${projectName}:`, error);
+    await handleMessageError(ctx, error, projectSession);
+  } finally {
+    // 12. Cleanup
+    stopProcessing();
+    typing.stop();
   }
-
-  // 13. Cleanup
-  stopProcessing();
-  typing.stop();
 }

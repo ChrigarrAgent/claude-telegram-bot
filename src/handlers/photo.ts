@@ -5,12 +5,11 @@
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
-import { StreamingState, createStatusCallback } from "./streaming";
-import { createMediaGroupBuffer, handleProcessingError } from "./media-group";
+import { createMediaGroupBuffer } from "./media-group";
+import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 // Create photo-specific media group buffer
 const photoBuffer = createMediaGroupBuffer({
@@ -56,8 +55,9 @@ async function processPhotos(
   username: string,
   chatId: number
 ): Promise<void> {
-  // Mark processing started
-  const stopProcessing = session.startProcessing();
+  const projectSession = await getSessionForChat(chatId);
+  const stopProcessing = projectSession.session.startProcessing();
+  const typing = startTypingIndicator(ctx);
 
   // Build prompt
   let prompt: string;
@@ -73,33 +73,27 @@ async function processPhotos(
   }
 
   // Set conversation title (if new session)
-  if (!session.isActive) {
+  if (!projectSession.isActive()) {
     const rawTitle = caption || "[Foto]";
     const title =
       rawTitle.length > 50 ? rawTitle.slice(0, 47) + "..." : rawTitle;
-    session.conversationTitle = title;
+    projectSession.session.conversationTitle = title;
   }
 
-  // Start typing
-  const typing = startTypingIndicator(ctx);
-
-  // Create streaming state
-  const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
-
   try {
-    const response = await session.sendMessageStreaming(
+    const { response } = await sendMessageWithRetry(
+      projectSession,
       prompt,
       username,
       userId,
-      statusCallback,
-      chatId,
-      ctx
+      ctx,
+      chatId
     );
 
+    projectSession.updateActivity();
     await auditLog(userId, username, "PHOTO", prompt, response);
   } catch (error) {
-    await handleProcessingError(ctx, error, state.toolMessages);
+    await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
     typing.stop();
