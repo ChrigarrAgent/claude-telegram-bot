@@ -30,9 +30,83 @@ import {
   handleCallback,
 } from "./handlers";
 import { scanAndGenerateAliases } from "./project-aliases";
+import type { ProjectSession } from "./project-session";
+import type { StatusCallback } from "./types";
+import { convertMarkdownToHtml } from "./formatting";
 
 // Create bot instance
 const bot = new Bot(TELEGRAM_TOKEN);
+
+/**
+ * Automatically continue a session after restart by sending a "continue" message to Claude.
+ * Streams the response back to the user via Telegram.
+ */
+async function autoContinueSession(
+  projectSession: ProjectSession,
+  chatId: number,
+  isCrash: boolean
+): Promise<void> {
+  try {
+    console.log(`Auto-continuing session for chat ${chatId}...`);
+
+    // Simple status callback that sends responses to Telegram
+    let currentMessage: any = null;
+    const statusCallback: StatusCallback = async (type, content, segmentId) => {
+      if (type === "text") {
+        const text = content || "";
+
+        if (!currentMessage) {
+          // Send first message
+          currentMessage = await bot.api.sendMessage(
+            chatId,
+            convertMarkdownToHtml(text),
+            { parse_mode: "HTML" }
+          );
+        } else {
+          // Update existing message
+          try {
+            await bot.api.editMessageText(
+              chatId,
+              currentMessage.message_id,
+              convertMarkdownToHtml(text),
+              { parse_mode: "HTML" }
+            );
+          } catch (e) {
+            // If edit fails (content unchanged or too long), ignore
+          }
+        }
+      }
+      // Skip other status types (tool, thinking, etc.) for auto-continue
+    };
+
+    // Send the continue message to Claude
+    const continuePrompt = isCrash
+      ? "You just restarted after a crash. Please continue where you left off."
+      : "You just restarted the bot. Please continue where you left off.";
+
+    await projectSession.sendMessage(
+      continuePrompt,
+      "system",
+      0,
+      statusCallback,
+      chatId,
+      undefined // no ctx available during startup
+    );
+
+    console.log(`Auto-continue completed for chat ${chatId}`);
+  } catch (error) {
+    console.error(`Auto-continue failed for chat ${chatId}:`, error);
+    // Send error message to user
+    try {
+      await bot.api.sendMessage(
+        chatId,
+        `⚠️ Failed to auto-continue: ${String(error).slice(0, 200)}`
+      );
+    } catch {
+      // Ignore if we can't even send error message
+    }
+  }
+}
 
 // Treat slash commands from forwarded messages as regular text (security: don't execute /restart from forwards)
 bot.use(async (ctx, next) => {
@@ -197,17 +271,24 @@ if (existsSync(HEARTBEAT_FILE)) {
           await bot.api.sendMessage(
             sess.chat_id,
             `⚠️ <b>Bot crashed and restarted</b>\n\n` +
-            `Resuming your session. Send a message to continue where you left off.`,
+            `Resuming your session automatically...`,
             { parse_mode: "HTML" }
           );
 
           // Restore the session
           const projectSession = await sessionManager.getOrCreateSession(sess.project_name);
           if (sess.session_id) {
-            projectSession.session.resumeSession(sess.session_id);
-            console.log(`Resumed crashed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
+            const [success, message] = projectSession.session.resumeSession(sess.session_id);
+            if (success) {
+              console.log(`Resumed crashed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
+              sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+
+              // Automatically continue the session
+              await autoContinueSession(projectSession, sess.chat_id, true);
+            } else {
+              console.warn(`Failed to resume crashed session for chat ${sess.chat_id}: ${message}`);
+            }
           }
-          sessionManager.setLastUsed(sess.chat_id, sess.project_name);
         } catch (resumeError) {
           console.warn(`Failed to resume crashed session for chat ${sess.chat_id}:`, resumeError);
         }
@@ -242,7 +323,7 @@ if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
           await bot.api.sendMessage(
             sess.chat_id,
             `🔄 <b>Bot restarted</b>\n\n` +
-            `Resuming your session. Send a message to continue where you left off.`,
+            `Resuming your session automatically...`,
             { parse_mode: "HTML" }
           );
 
@@ -250,12 +331,19 @@ if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
           const projectSession = await sessionManager.getOrCreateSession(sess.project_name);
 
           if (sess.session_id) {
-            projectSession.session.resumeSession(sess.session_id);
-            console.log(`Resumed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
-          }
+            const [success, message] = projectSession.session.resumeSession(sess.session_id);
+            if (success) {
+              console.log(`Resumed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
 
-          // Track this chat's project
-          sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+              // Track this chat's project
+              sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+
+              // Automatically continue the session
+              await autoContinueSession(projectSession, sess.chat_id, false);
+            } else {
+              console.warn(`Failed to resume session for chat ${sess.chat_id}: ${message}`);
+            }
+          }
         } catch (resumeError) {
           console.warn(`Failed to resume session for chat ${sess.chat_id}:`, resumeError);
         }
