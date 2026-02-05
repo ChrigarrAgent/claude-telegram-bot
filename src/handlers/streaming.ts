@@ -118,16 +118,17 @@ export function createStatusCallback(
         const now = Date.now();
         const lastEdit = state.lastEditTimes.get(segmentId) || 0;
 
-        // Add project prefix to ALL text messages (every segment)
-        const displayContent = `<b>${projectAlias}:</b> ${content}`;
-
         if (!state.textMessages.has(segmentId)) {
           // New segment - create message
+          // First truncate if needed
           const display =
-            displayContent.length > TELEGRAM_SAFE_LIMIT
-              ? displayContent.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
-              : displayContent;
-          const formatted = convertMarkdownToHtml(display);
+            content.length > TELEGRAM_SAFE_LIMIT
+              ? content.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
+              : content;
+          // Convert markdown to HTML first
+          const htmlContent = convertMarkdownToHtml(display);
+          // Then add project prefix (won't be escaped)
+          const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
           try {
             const msg = await ctx.reply(formatted, { parse_mode: "HTML" });
             state.textMessages.set(segmentId, msg);
@@ -143,11 +144,15 @@ export function createStatusCallback(
         } else if (now - lastEdit > STREAMING_THROTTLE_MS) {
           // Update existing segment message (throttled)
           const msg = state.textMessages.get(segmentId)!;
+          // First truncate if needed
           const display =
-            displayContent.length > TELEGRAM_SAFE_LIMIT
-              ? displayContent.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
-              : displayContent;
-          const formatted = convertMarkdownToHtml(display);
+            content.length > TELEGRAM_SAFE_LIMIT
+              ? content.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
+              : content;
+          // Convert markdown to HTML first
+          const htmlContent = convertMarkdownToHtml(display);
+          // Then add project prefix (won't be escaped)
+          const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
           // Skip if content unchanged
           if (formatted === state.lastContent.get(segmentId)) {
             return;
@@ -180,9 +185,10 @@ export function createStatusCallback(
       } else if (statusType === "segment_end" && segmentId !== undefined) {
         if (state.textMessages.has(segmentId) && content) {
           const msg = state.textMessages.get(segmentId)!;
-          // Add project prefix to ALL segments
-          const finalContent = `<b>${projectAlias}:</b> ${content}`;
-          const formatted = convertMarkdownToHtml(finalContent);
+          // Convert markdown to HTML first
+          const htmlContent = convertMarkdownToHtml(content);
+          // Then add project prefix (won't be escaped)
+          const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
 
           // Skip if content unchanged
           if (formatted === state.lastContent.get(segmentId)) {

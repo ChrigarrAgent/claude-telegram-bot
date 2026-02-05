@@ -58,14 +58,16 @@ async function autoContinueSession(
     const statusCallback: StatusCallback = async (type, content, segmentId) => {
       if (type === "text") {
         const text = content || "";
-        // Add project prefix to all messages
-        const prefixedText = `<b>${projectAlias}:</b> ${text}`;
+        // Convert markdown to HTML first
+        const htmlText = convertMarkdownToHtml(text);
+        // Then add project prefix (won't be escaped)
+        const prefixedText = `<b>${projectAlias}:</b> ${htmlText}`;
 
         if (!currentMessage) {
           // Send first message
           currentMessage = await bot.api.sendMessage(
             chatId,
-            convertMarkdownToHtml(prefixedText),
+            prefixedText,
             { parse_mode: "HTML" }
           );
         } else {
@@ -74,7 +76,7 @@ async function autoContinueSession(
             await bot.api.editMessageText(
               chatId,
               currentMessage.message_id,
-              convertMarkdownToHtml(prefixedText),
+              prefixedText,
               { parse_mode: "HTML" }
             );
           } catch (e) {
@@ -82,7 +84,8 @@ async function autoContinueSession(
           }
         }
       } else if (type === "tool") {
-        // Add project prefix to tool messages during auto-continue
+        // Tool messages don't need markdown conversion (they're already HTML)
+        // Just add project prefix
         const toolContent = `<b>${projectAlias}:</b> ${content}`;
         try {
           await bot.api.sendMessage(chatId, toolContent, { parse_mode: "HTML" });
