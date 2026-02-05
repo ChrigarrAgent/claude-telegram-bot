@@ -83,17 +83,134 @@ export async function checkPendingAskUserRequests(
  * Tracks state for streaming message updates.
  */
 export class StreamingState {
-  textMessages = new Map<number, Message>(); // segment_id -> telegram message
-  toolMessages: Message[] = []; // ephemeral tool status messages
-  lastEditTimes = new Map<number, number>(); // segment_id -> last edit time
-  lastContent = new Map<number, string>(); // segment_id -> last sent content
-  prefixAdded = false; // track if project prefix has been added
+  // Consolidated streaming: ONE working message for all progress
+  workingMessage: Message | null = null; // The single live-edited progress message
+  workingContent: string[] = []; // Accumulated content (thinking, tools, progress)
+  lastEditTime: number = 0; // Last edit time for throttling
+  finalTextSegments: string[] = []; // Final text segments to send as separate message
+
+  // Legacy fields for backward compatibility (not used in consolidated mode)
+  textMessages = new Map<number, Message>();
+  toolMessages: Message[] = [];
+  lastEditTimes = new Map<number, number>();
+  lastContent = new Map<number, string>();
+  prefixAdded = false;
 }
 
 /**
- * Create a status callback for streaming updates.
+ * Create a status callback for streaming updates - CONSOLIDATED MODE.
+ * All progress (thinking, tools, intermediate text) goes into ONE live-edited message.
+ * Final answer is sent as a separate clean message.
  */
 export function createStatusCallback(
+  ctx: Context,
+  state: StreamingState,
+  projectAlias: string = "default"
+): StatusCallback {
+  return async (statusType: StatusType, content: string, segmentId?: number) => {
+    try {
+      const now = Date.now();
+
+      // Create working message on first event
+      if (!state.workingMessage) {
+        state.workingMessage = await ctx.reply(
+          `🔄 <b>${projectAlias}:</b> Working...`,
+          { parse_mode: "HTML" }
+        );
+      }
+
+      if (statusType === "thinking") {
+        // Add thinking to working content
+        const preview = content.length > 400 ? content.slice(0, 400) + "..." : content;
+        const escaped = escapeHtml(preview);
+        state.workingContent.push(`🧠 <i>${escaped}</i>`);
+
+        // Update working message (throttled)
+        if (now - state.lastEditTime > STREAMING_THROTTLE_MS) {
+          await updateWorkingMessage(ctx, state, projectAlias);
+        }
+      } else if (statusType === "tool") {
+        // Add tool to working content (already has HTML)
+        state.workingContent.push(content);
+
+        // Update working message (throttled)
+        if (now - state.lastEditTime > STREAMING_THROTTLE_MS) {
+          await updateWorkingMessage(ctx, state, projectAlias);
+        }
+      } else if (statusType === "text" && segmentId !== undefined) {
+        // Intermediate text - add to working content with truncation
+        const preview = content.length > 300 ? content.slice(0, 300) + "..." : content;
+        const escaped = escapeHtml(preview);
+        state.workingContent.push(`📝 ${escaped}`);
+
+        // Update working message (throttled)
+        if (now - state.lastEditTime > STREAMING_THROTTLE_MS) {
+          await updateWorkingMessage(ctx, state, projectAlias);
+        }
+      } else if (statusType === "segment_end" && segmentId !== undefined) {
+        // Store final text segment for later
+        if (content) {
+          state.finalTextSegments.push(content);
+        }
+      } else if (statusType === "done") {
+        // Send final answer as separate clean message
+        if (state.finalTextSegments.length > 0) {
+          const finalText = state.finalTextSegments.join("\n\n");
+          const htmlContent = convertMarkdownToHtml(finalText);
+          const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
+
+          try {
+            await ctx.reply(formatted, { parse_mode: "HTML" });
+          } catch (htmlError) {
+            console.debug("HTML reply failed for final answer, escaping:", htmlError);
+            const escaped = escapeHtml(finalText);
+            await ctx.reply(`<b>${projectAlias}:</b> ${escaped}`, { parse_mode: "HTML" });
+          }
+        }
+
+        // Update working message one last time with "Complete" status
+        state.workingContent.push("✅ <b>Complete</b>");
+        await updateWorkingMessage(ctx, state, projectAlias);
+      }
+    } catch (error) {
+      console.error("Status callback error:", error);
+    }
+  };
+}
+
+/**
+ * Helper function to update the working message with accumulated content.
+ */
+async function updateWorkingMessage(
+  ctx: Context,
+  state: StreamingState,
+  projectAlias: string
+): Promise<void> {
+  if (!state.workingMessage) return;
+
+  const content = state.workingContent.join("\n\n");
+  const fullMessage = `🔄 <b>${projectAlias}:</b> Working...\n\n${content}`;
+
+  // Truncate if too long (Telegram limit)
+  const truncated = fullMessage.length > TELEGRAM_MESSAGE_LIMIT
+    ? fullMessage.slice(0, TELEGRAM_MESSAGE_LIMIT - 100) + "\n\n<i>... (truncated)</i>"
+    : fullMessage;
+
+  try {
+    await ctx.api.editMessageText(
+      state.workingMessage.chat.id,
+      state.workingMessage.message_id,
+      truncated,
+      { parse_mode: "HTML" }
+    );
+    state.lastEditTime = Date.now();
+  } catch (error) {
+    console.debug("Failed to update working message:", error);
+  }
+}
+
+// Legacy callback for backward compatibility - keeping old implementation below
+function createLegacyStatusCallback(
   ctx: Context,
   state: StreamingState,
   projectAlias: string = "default"
