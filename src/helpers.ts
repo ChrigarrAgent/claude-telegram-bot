@@ -9,6 +9,7 @@ import type { ProjectSession } from "./project-session";
 import { sessionManager } from "./session-manager";
 import { getWorkingDir } from "./config";
 import { StreamingState, createStatusCallback } from "./handlers/streaming";
+import { getProjectAlias } from "./project-aliases";
 
 /**
  * Get the project name for a chat, using last-used or deriving from working directory.
@@ -57,8 +58,9 @@ export async function sendMessageWithRetry(
   chatId: number,
   maxRetries = 1
 ): Promise<SendMessageResult> {
+  const projectAlias = getProjectAlias(projectSession.workingDir);
   let state = new StreamingState();
-  let statusCallback = createStatusCallback(ctx, state);
+  let statusCallback = createStatusCallback(ctx, state, projectAlias);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -94,7 +96,7 @@ export async function sendMessageWithRetry(
 
         // Reset state for retry
         state = new StreamingState();
-        statusCallback = createStatusCallback(ctx, state);
+        statusCallback = createStatusCallback(ctx, state, projectAlias);
         continue;
       }
 

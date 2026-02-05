@@ -132,8 +132,9 @@ export async function handleCallback(ctx: Context): Promise<void> {
   const typing = startTypingIndicator(ctx);
 
   // Create streaming state
+  const projectAlias = getProjectAlias(projectSession.workingDir);
   const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
+  const statusCallback = createStatusCallback(ctx, state, projectAlias);
 
   try {
     const response = await projectSession.sendMessage(
@@ -272,8 +273,9 @@ async function handleResumeCallback(
     "Please write a very concise recap of where we are in this conversation, to refresh my memory. Max 2-3 sentences.";
 
   const typing = startTypingIndicator(ctx);
+  const projectAlias = getProjectAlias(projectSession.workingDir);
   const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
+  const statusCallback = createStatusCallback(ctx, state, projectAlias);
 
   try {
     await projectSession.sendMessage(

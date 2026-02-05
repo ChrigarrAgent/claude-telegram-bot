@@ -87,6 +87,7 @@ export class StreamingState {
   toolMessages: Message[] = []; // ephemeral tool status messages
   lastEditTimes = new Map<number, number>(); // segment_id -> last edit time
   lastContent = new Map<number, string>(); // segment_id -> last sent content
+  prefixAdded = false; // track if project prefix has been added
 }
 
 /**
@@ -94,7 +95,8 @@ export class StreamingState {
  */
 export function createStatusCallback(
   ctx: Context,
-  state: StreamingState
+  state: StreamingState,
+  projectAlias: string = "default"
 ): StatusCallback {
   return async (statusType: StatusType, content: string, segmentId?: number) => {
     try {
@@ -103,23 +105,28 @@ export function createStatusCallback(
         const preview =
           content.length > 500 ? content.slice(0, 500) + "..." : content;
         const escaped = escapeHtml(preview);
-        const thinkingMsg = await ctx.reply(`🧠 <i>${escaped}</i>`, {
+        const thinkingMsg = await ctx.reply(`<b>${projectAlias}:</b> 🧠 <i>${escaped}</i>`, {
           parse_mode: "HTML",
         });
         state.toolMessages.push(thinkingMsg);
       } else if (statusType === "tool") {
-        const toolMsg = await ctx.reply(content, { parse_mode: "HTML" });
+        // Add project prefix to tool messages
+        const toolContent = `<b>${projectAlias}:</b> ${content}`;
+        const toolMsg = await ctx.reply(toolContent, { parse_mode: "HTML" });
         state.toolMessages.push(toolMsg);
       } else if (statusType === "text" && segmentId !== undefined) {
         const now = Date.now();
         const lastEdit = state.lastEditTimes.get(segmentId) || 0;
 
+        // Add project prefix to ALL text messages (every segment)
+        const displayContent = `<b>${projectAlias}:</b> ${content}`;
+
         if (!state.textMessages.has(segmentId)) {
           // New segment - create message
           const display =
-            content.length > TELEGRAM_SAFE_LIMIT
-              ? content.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
-              : content;
+            displayContent.length > TELEGRAM_SAFE_LIMIT
+              ? displayContent.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
+              : displayContent;
           const formatted = convertMarkdownToHtml(display);
           try {
             const msg = await ctx.reply(formatted, { parse_mode: "HTML" });
@@ -137,9 +144,9 @@ export function createStatusCallback(
           // Update existing segment message (throttled)
           const msg = state.textMessages.get(segmentId)!;
           const display =
-            content.length > TELEGRAM_SAFE_LIMIT
-              ? content.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
-              : content;
+            displayContent.length > TELEGRAM_SAFE_LIMIT
+              ? displayContent.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
+              : displayContent;
           const formatted = convertMarkdownToHtml(display);
           // Skip if content unchanged
           if (formatted === state.lastContent.get(segmentId)) {
@@ -173,7 +180,9 @@ export function createStatusCallback(
       } else if (statusType === "segment_end" && segmentId !== undefined) {
         if (state.textMessages.has(segmentId) && content) {
           const msg = state.textMessages.get(segmentId)!;
-          const formatted = convertMarkdownToHtml(content);
+          // Add project prefix to ALL segments
+          const finalContent = `<b>${projectAlias}:</b> ${content}`;
+          const formatted = convertMarkdownToHtml(finalContent);
 
           // Skip if content unchanged
           if (formatted === state.lastContent.get(segmentId)) {

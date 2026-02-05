@@ -49,17 +49,23 @@ async function autoContinueSession(
   try {
     console.log(`Auto-continuing session for chat ${chatId}...`);
 
+    // Get project alias for prefixing messages
+    const { getProjectAlias } = await import("./project-aliases");
+    const projectAlias = getProjectAlias(projectSession.workingDir);
+
     // Simple status callback that sends responses to Telegram
     let currentMessage: any = null;
     const statusCallback: StatusCallback = async (type, content, segmentId) => {
       if (type === "text") {
         const text = content || "";
+        // Add project prefix to all messages
+        const prefixedText = `<b>${projectAlias}:</b> ${text}`;
 
         if (!currentMessage) {
           // Send first message
           currentMessage = await bot.api.sendMessage(
             chatId,
-            convertMarkdownToHtml(text),
+            convertMarkdownToHtml(prefixedText),
             { parse_mode: "HTML" }
           );
         } else {
@@ -68,15 +74,23 @@ async function autoContinueSession(
             await bot.api.editMessageText(
               chatId,
               currentMessage.message_id,
-              convertMarkdownToHtml(text),
+              convertMarkdownToHtml(prefixedText),
               { parse_mode: "HTML" }
             );
           } catch (e) {
             // If edit fails (content unchanged or too long), ignore
           }
         }
+      } else if (type === "tool") {
+        // Add project prefix to tool messages during auto-continue
+        const toolContent = `<b>${projectAlias}:</b> ${content}`;
+        try {
+          await bot.api.sendMessage(chatId, toolContent, { parse_mode: "HTML" });
+        } catch (e) {
+          // If send fails, ignore
+        }
       }
-      // Skip other status types (tool, thinking, etc.) for auto-continue
+      // Skip other status types (thinking, etc.) for auto-continue
     };
 
     // Send the continue message to Claude

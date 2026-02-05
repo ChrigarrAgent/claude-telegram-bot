@@ -12,7 +12,6 @@ import {
   auditLog,
   auditLogRateLimit,
   checkInterrupt,
-  startTypingIndicator,
 } from "../utils";
 import { getProjectAlias, getProjectByAlias } from "../project-aliases";
 import { getProjectNameForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
@@ -269,28 +268,13 @@ export async function handleText(ctx: Context): Promise<void> {
     projectSession.session.conversationTitle = title;
   }
 
-  // 6. Show project header based on config (with alias)
-  const shouldShowHeader =
-    SHOW_PROJECT_HEADERS === "always" ||
-    (SHOW_PROJECT_HEADERS === "multiple" && sessionManager.getAllSessions().length > 1);
-
-  // Show project switch notification if using @-syntax
-  if (targetProjectFromAtSyntax) {
-    const projectAlias = getProjectAlias(projectSession.workingDir);
-    await ctx.reply(`📁 <b>${projectAlias}</b>`, { parse_mode: "HTML" });
-  } else if (shouldShowHeader && projectName !== "default") {
-    const projectAlias = getProjectAlias(projectSession.workingDir);
-    await ctx.reply(`<b>${projectAlias}</b>:`, { parse_mode: "HTML" });
-  }
+  // 6. Project header removed - project name is shown on every message instead
 
   // 7. Mark processing started (on project session)
   const stopProcessing = projectSession.session.startProcessing();
 
-  // 8. Start typing indicator
-  const typing = startTypingIndicator(ctx);
-
   try {
-    // 9. Send to Claude with retry logic
+    // 8. Send to Claude with retry logic
     const { response } = await sendMessageWithRetry(
       projectSession,
       message,
@@ -300,17 +284,16 @@ export async function handleText(ctx: Context): Promise<void> {
       chatId
     );
 
-    // 10. Update project activity (lastUsed already set above)
+    // 9. Update project activity (lastUsed already set above)
     projectSession.updateActivity();
 
-    // 11. Audit log
+    // 10. Audit log
     await auditLog(userId, username, "TEXT", message, response);
   } catch (error) {
     console.error(`Error processing message for ${projectName}:`, error);
     await handleMessageError(ctx, error, projectSession);
   } finally {
-    // 12. Cleanup
+    // 11. Cleanup
     stopProcessing();
-    typing.stop();
   }
 }
