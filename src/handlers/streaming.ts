@@ -134,11 +134,13 @@ export function createStatusCallback(
             state.textMessages.set(segmentId, msg);
             state.lastContent.set(segmentId, formatted);
           } catch (htmlError) {
-            // HTML parse failed, fall back to plain text
-            console.debug("HTML reply failed, using plain text:", htmlError);
-            const msg = await ctx.reply(formatted);
+            // HTML parse failed - escape the original content and retry with HTML mode
+            console.debug("HTML reply failed, escaping and retrying:", htmlError);
+            const escaped = escapeHtml(display);
+            const fallback = `<b>${projectAlias}:</b> ${escaped}`;
+            const msg = await ctx.reply(fallback, { parse_mode: "HTML" });
             state.textMessages.set(segmentId, msg);
-            state.lastContent.set(segmentId, formatted);
+            state.lastContent.set(segmentId, fallback);
           }
           state.lastEditTimes.set(segmentId, now);
         } else if (now - lastEdit > STREAMING_THROTTLE_MS) {
@@ -168,16 +170,20 @@ export function createStatusCallback(
             );
             state.lastContent.set(segmentId, formatted);
           } catch (htmlError) {
-            console.debug("HTML edit failed, trying plain text:", htmlError);
+            console.debug("HTML edit failed, escaping and retrying:", htmlError);
             try {
+              // Escape the original content and retry with HTML mode
+              const escaped = escapeHtml(display);
+              const fallback = `<b>${projectAlias}:</b> ${escaped}`;
               await ctx.api.editMessageText(
                 msg.chat.id,
                 msg.message_id,
-                formatted
+                fallback,
+                { parse_mode: "HTML" }
               );
-              state.lastContent.set(segmentId, formatted);
+              state.lastContent.set(segmentId, fallback);
             } catch (editError) {
-              console.debug("Edit message failed:", editError);
+              console.debug("Edit message failed completely:", editError);
             }
           }
           state.lastEditTimes.set(segmentId, now);
@@ -221,10 +227,14 @@ export function createStatusCallback(
                 await ctx.reply(chunk, { parse_mode: "HTML" });
               } catch (htmlError) {
                 console.debug(
-                  "HTML chunk failed, using plain text:",
+                  "HTML chunk failed, escaping and retrying:",
                   htmlError
                 );
-                await ctx.reply(chunk);
+                // Escape and retry with HTML mode
+                const chunkText = chunk.replace(/<b>.*?:<\/b>\s*/, ''); // Remove prefix temporarily
+                const escaped = escapeHtml(chunkText);
+                const fallback = i === 0 ? `<b>${projectAlias}:</b> ${escaped}` : escaped;
+                await ctx.reply(fallback, { parse_mode: "HTML" });
               }
             }
           }
