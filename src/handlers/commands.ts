@@ -89,6 +89,13 @@ export async function handleNew(ctx: Context): Promise<void> {
     // Clear the project's session
     await projectSession.kill();
     const projectAlias = getProjectAlias(projectSession.workingDir);
+
+    // CRITICAL: Preserve the project mapping after killing session
+    // This ensures next message stays in the same project
+    if (chatId && projectName) {
+      sessionManager.setLastUsed(chatId, projectName);
+    }
+
     await ctx.reply(`🆕 Session cleared for <b>${projectAlias}</b>. Next message starts fresh.`, { parse_mode: "HTML" });
   } else {
     // Fallback to global session for backwards compatibility
