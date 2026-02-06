@@ -426,6 +426,18 @@ When you only need to read data (like the session history file), don't instantia
 
 `Bun.file(path).size` throws or returns 0 for missing files depending on the Bun version — it's unreliable as an existence check. Use `existsSync()` from Node's `fs` module instead.
 
+### Always Use Consolidated Status Callbacks
+
+**Symptom**: After resuming from a long-running task (or auto-continuing after restart/crash), every tool call and text event was sent as its own separate Telegram message instead of being consolidated into one updating "Working..." message.
+
+**Cause**: `handleProcessCompletion()` and `autoContinueSession()` in `index.ts` used inline status callbacks that sent each `tool` event as a new message and only handled `text` and `tool` events. They didn't handle `thinking`, `segment_end`, or `done`, and didn't accumulate progress into a single working message.
+
+**Fix**: Created `createBotApiStatusCallback(api, chatId, projectAlias)` in `streaming.ts` that mirrors the exact same consolidated pattern as `createStatusCallback(ctx, state, projectAlias)` but works with `bot.api` + `chatId` instead of a grammY `ctx` object. Replaced both inline callbacks with calls to this function.
+
+**Rule**: Never write inline status callbacks. All code paths that receive streaming events from Claude must use one of:
+- `createStatusCallback(ctx, state, projectAlias)` — when a grammY `ctx` is available (normal message handlers)
+- `createBotApiStatusCallback(api, chatId, projectAlias)` — when only `bot.api` + `chatId` are available (startup resume, process completion, anything outside a handler)
+
 ## Running on Ubuntu Server (PM2)
 
 ```bash
