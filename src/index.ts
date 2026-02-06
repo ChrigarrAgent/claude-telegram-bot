@@ -29,11 +29,10 @@ import {
   handlePhoto,
   handleDocument,
   handleCallback,
+  createBotApiStatusCallback,
 } from "./handlers";
 import { scanAndGenerateAliases } from "./project-aliases";
 import type { ProjectSession } from "./project-session";
-import type { StatusCallback } from "./types";
-import { convertMarkdownToHtml } from "./formatting";
 import { processMonitor } from "./process-monitor";
 import type { LongRunStatus } from "./process-monitor";
 
@@ -56,48 +55,8 @@ async function autoContinueSession(
     const { getProjectAlias } = await import("./project-aliases");
     const projectAlias = getProjectAlias(projectSession.workingDir);
 
-    // Simple status callback that sends responses to Telegram
-    let currentMessage: any = null;
-    const statusCallback: StatusCallback = async (type, content, segmentId) => {
-      if (type === "text") {
-        const text = content || "";
-        // Convert markdown to HTML first
-        const htmlText = convertMarkdownToHtml(text);
-        // Then add project prefix (won't be escaped)
-        const prefixedText = `<b>${projectAlias}:</b> ${htmlText}`;
-
-        if (!currentMessage) {
-          // Send first message
-          currentMessage = await bot.api.sendMessage(
-            chatId,
-            prefixedText,
-            { parse_mode: "HTML" }
-          );
-        } else {
-          // Update existing message
-          try {
-            await bot.api.editMessageText(
-              chatId,
-              currentMessage.message_id,
-              prefixedText,
-              { parse_mode: "HTML" }
-            );
-          } catch (e) {
-            // If edit fails (content unchanged or too long), ignore
-          }
-        }
-      } else if (type === "tool") {
-        // Tool messages don't need markdown conversion (they're already HTML)
-        // Just add project prefix
-        const toolContent = `<b>${projectAlias}:</b> ${content}`;
-        try {
-          await bot.api.sendMessage(chatId, toolContent, { parse_mode: "HTML" });
-        } catch (e) {
-          // If send fails, ignore
-        }
-      }
-      // Skip other status types (thinking, etc.) for auto-continue
-    };
+    // Use consolidated status callback (same pattern as normal message flow)
+    const statusCallback = createBotApiStatusCallback(bot.api, chatId, projectAlias);
 
     // Send the continue message to Claude
     const continuePrompt = isCrash
@@ -211,43 +170,9 @@ async function handleProcessCompletion(status: LongRunStatus): Promise<void> {
 
     // Send synthetic message to Claude to read the log and continue
     const primaryChatId = chatIds[0]!;
-    let currentMessage: any = null;
 
-    const statusCallback: StatusCallback = async (type, content, segmentId) => {
-      if (type === "text") {
-        const text = content || "";
-        const htmlText = convertMarkdownToHtml(text);
-        const prefixedText = `<b>${projectAlias}:</b> ${htmlText}`;
-
-        if (!currentMessage) {
-          currentMessage = await bot.api.sendMessage(
-            primaryChatId,
-            prefixedText,
-            { parse_mode: "HTML" }
-          );
-        } else {
-          try {
-            await bot.api.editMessageText(
-              primaryChatId,
-              currentMessage.message_id,
-              prefixedText,
-              { parse_mode: "HTML" }
-            );
-          } catch {
-            // Ignore edit failures
-          }
-        }
-      } else if (type === "tool") {
-        const toolContent = `<b>${projectAlias}:</b> ${content}`;
-        try {
-          await bot.api.sendMessage(primaryChatId, toolContent, {
-            parse_mode: "HTML",
-          });
-        } catch {
-          // Ignore send failures
-        }
-      }
-    };
+    // Use consolidated status callback (same pattern as normal message flow)
+    const statusCallback = createBotApiStatusCallback(bot.api, primaryChatId, projectAlias);
 
     const logFile = `/tmp/long-run/${status.id}.log`;
     const prompt =

@@ -21,7 +21,7 @@ export { handleVoice } from "./voice";
 export { handlePhoto } from "./photo";
 export { handleDocument } from "./document";
 export { handleCallback } from "./callback";
-export { StreamingState, createStatusCallback } from "./streaming";
+export { StreamingState, createStatusCallback, createBotApiStatusCallback } from "./streaming";
 export {
   isAskUserQuestionInput,
   displayAskUserQuestions,

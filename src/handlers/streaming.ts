@@ -5,6 +5,7 @@
  */
 
 import type { Context } from "grammy";
+import type { Api } from "grammy";
 import type { Message } from "grammy/types";
 import { InlineKeyboard } from "grammy";
 import type { StatusCallback, StatusType } from "../types";
@@ -316,6 +317,206 @@ async function updateWorkingMessage(
     state.lastEditTime = Date.now();
   } catch (error: any) {
     // Don't log "message is not modified" errors - that's expected
+    if (!error?.description?.includes("message is not modified")) {
+      console.warn("Failed to update working message:", error?.description || error);
+    }
+  }
+}
+
+/**
+ * Send a long message via Bot API (no ctx needed), splitting if necessary.
+ */
+async function sendLongMessageViaApi(
+  api: Api,
+  chatId: number,
+  text: string,
+  projectAlias: string
+): Promise<void> {
+  const htmlContent = convertMarkdownToHtml(text);
+  const prefix = `<b>${projectAlias}:</b> `;
+  const formatted = prefix + htmlContent;
+
+  if (formatted.length <= TELEGRAM_SAFE_LIMIT) {
+    try {
+      await api.sendMessage(chatId, formatted, { parse_mode: "HTML" });
+      return;
+    } catch (htmlError: any) {
+      if (!htmlError?.description?.includes("too long")) {
+        console.warn("HTML reply failed, escaping:", htmlError?.description);
+        const escaped = escapeHtml(text);
+        const fallback = prefix + escaped;
+        if (fallback.length <= TELEGRAM_SAFE_LIMIT) {
+          await api.sendMessage(chatId, fallback, { parse_mode: "HTML" });
+          return;
+        }
+      }
+    }
+  }
+
+  // Message is too long - split it
+  const paragraphs = text.split(/\n\n+/);
+  const chunks: string[] = [];
+  let currentChunk = "";
+
+  for (const para of paragraphs) {
+    const testChunk = currentChunk ? currentChunk + "\n\n" + para : para;
+    const maxLen = chunks.length === 0 ? TELEGRAM_SAFE_LIMIT - prefix.length - 50 : TELEGRAM_SAFE_LIMIT - 50;
+
+    if (testChunk.length <= maxLen) {
+      currentChunk = testChunk;
+    } else {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+      }
+      if (para.length > maxLen) {
+        const lines = para.split("\n");
+        currentChunk = "";
+        for (const line of lines) {
+          const testLine = currentChunk ? currentChunk + "\n" + line : line;
+          if (testLine.length <= maxLen) {
+            currentChunk = testLine;
+          } else {
+            if (currentChunk) chunks.push(currentChunk);
+            if (line.length > maxLen) {
+              for (let i = 0; i < line.length; i += maxLen) {
+                chunks.push(line.slice(i, i + maxLen));
+              }
+              currentChunk = "";
+            } else {
+              currentChunk = line;
+            }
+          }
+        }
+      } else {
+        currentChunk = para;
+      }
+    }
+  }
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]!;
+    const isFirst = i === 0;
+    const chunkPrefix = isFirst ? prefix : "";
+    const partIndicator = chunks.length > 1 ? ` <i>(${i + 1}/${chunks.length})</i>` : "";
+
+    try {
+      const htmlChunk = convertMarkdownToHtml(chunk);
+      await api.sendMessage(chatId, chunkPrefix + htmlChunk + partIndicator, { parse_mode: "HTML" });
+    } catch (htmlError) {
+      const escaped = escapeHtml(chunk);
+      await api.sendMessage(chatId, chunkPrefix + escaped + partIndicator, { parse_mode: "HTML" });
+    }
+
+    if (i < chunks.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+}
+
+/**
+ * Create a consolidated status callback using Bot API directly (no ctx needed).
+ * Used for auto-continue after restart and process completion handlers.
+ * Mirrors createStatusCallback behavior: one working message for progress,
+ * final answer sent as separate message.
+ */
+export function createBotApiStatusCallback(
+  api: Api,
+  chatId: number,
+  projectAlias: string = "default"
+): StatusCallback {
+  const state = new StreamingState();
+
+  return async (statusType: StatusType, content: string, segmentId?: number) => {
+    try {
+      // Create working message on first event
+      if (!state.workingMessage) {
+        state.workingMessage = await api.sendMessage(
+          chatId,
+          `🔄 <b>${projectAlias}:</b> Working...`,
+          { parse_mode: "HTML" }
+        );
+      }
+
+      if (statusType === "thinking") {
+        const preview = content.length > 300 ? content.slice(0, 300) + "..." : content;
+        const escaped = escapeHtml(preview);
+        state.workingContent.push(`🧠 <i>${escaped}</i>`);
+        await updateWorkingMessageViaApi(api, chatId, state, projectAlias);
+      } else if (statusType === "tool") {
+        if (state.finalTextSegments.length > 0) {
+          state.finalTextSegments = [];
+        }
+        state.workingContent.push(content);
+        await updateWorkingMessageViaApi(api, chatId, state, projectAlias);
+      } else if (statusType === "text" && segmentId !== undefined) {
+        // Intermediate text - skip (same as consolidated mode)
+      } else if (statusType === "segment_end" && segmentId !== undefined) {
+        if (content) {
+          state.finalTextSegments.push(content);
+        }
+      } else if (statusType === "done") {
+        state.workingContent.push("✅ <b>Complete</b>");
+        await updateWorkingMessageViaApi(api, chatId, state, projectAlias);
+
+        if (state.finalTextSegments.length > 0) {
+          const finalText = state.finalTextSegments.join("\n\n");
+          await sendLongMessageViaApi(api, chatId, finalText, projectAlias);
+        }
+      }
+    } catch (error) {
+      console.error("Bot API status callback error:", error);
+    }
+  };
+}
+
+/**
+ * Helper to update the working message via Bot API (no ctx needed).
+ */
+async function updateWorkingMessageViaApi(
+  api: Api,
+  chatId: number,
+  state: StreamingState,
+  projectAlias: string
+): Promise<void> {
+  if (!state.workingMessage) return;
+
+  const content = state.workingContent.join("\n");
+  const fullMessage = `🔄 <b>${projectAlias}:</b>\n${content}`;
+
+  let truncated = fullMessage;
+  if (fullMessage.length > TELEGRAM_MESSAGE_LIMIT) {
+    const header = `🔄 <b>${projectAlias}:</b>\n<i>... earlier progress truncated ...</i>\n`;
+    const availableSpace = TELEGRAM_MESSAGE_LIMIT - header.length - 50;
+
+    const items = state.workingContent.slice();
+    let kept: string[] = [];
+    let totalLen = 0;
+
+    for (let i = items.length - 1; i >= 0 && totalLen < availableSpace; i--) {
+      const item = items[i]!;
+      if (totalLen + item.length + 1 <= availableSpace) {
+        kept.unshift(item);
+        totalLen += item.length + 1;
+      } else {
+        break;
+      }
+    }
+
+    truncated = header + kept.join("\n");
+  }
+
+  try {
+    await api.editMessageText(
+      chatId,
+      state.workingMessage.message_id,
+      truncated,
+      { parse_mode: "HTML" }
+    );
+    state.lastEditTime = Date.now();
+  } catch (error: any) {
     if (!error?.description?.includes("message is not modified")) {
       console.warn("Failed to update working message:", error?.description || error);
     }
