@@ -317,8 +317,18 @@ if (existsSync(HEARTBEAT_FILE)) {
     // If heartbeat is recent (within 2 minutes), this was a crash
     if (age < 2 * 60 * 1000 && heartbeat.sessions.length > 0) {
       console.log(`Detected crash! Last heartbeat was ${Math.round(age / 1000)}s ago`);
-      crashedSessions = heartbeat.sessions.filter(s => s.was_running && s.session_id);
 
+      // Restore routing for ALL sessions from heartbeat
+      const allHeartbeatSessions = heartbeat.sessions.filter(s => s.session_id);
+      crashedSessions = allHeartbeatSessions.filter(s => s.was_running);
+
+      // First: restore project routing for all sessions
+      for (const sess of allHeartbeatSessions) {
+        sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+        await sessionManager.getOrCreateSession(sess.project_name);
+      }
+
+      // Then: auto-continue only crashed (was_running) sessions
       for (const sess of crashedSessions) {
         try {
           await bot.api.sendMessage(
@@ -334,7 +344,6 @@ if (existsSync(HEARTBEAT_FILE)) {
             const [success, message] = projectSession.session.resumeSession(sess.session_id);
             if (success) {
               console.log(`Resumed crashed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
-              sessionManager.setLastUsed(sess.chat_id, sess.project_name);
 
               // Automatically continue the session
               await autoContinueSession(projectSession, sess.chat_id, true);
@@ -365,11 +374,21 @@ if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
 
     // Only resume if shutdown was recent (within 5 minutes)
     if (age < 5 * 60 * 1000) {
-      // Filter to only sessions that were actively running
-      const interruptedSessions = data.sessions.filter(s => s.was_running && s.session_id);
+      // Restore project routing for ALL sessions (so messages route correctly after restart)
+      const allSavedSessions = data.sessions.filter(s => s.session_id);
+      const interruptedSessions = allSavedSessions.filter(s => s.was_running);
 
-      console.log(`Found ${interruptedSessions.length} interrupted sessions to resume`);
+      console.log(`Restoring ${allSavedSessions.length} sessions (${interruptedSessions.length} were running)`);
 
+      // First pass: restore lastUsed routing for ALL sessions
+      for (const sess of allSavedSessions) {
+        sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+        // Ensure project session exists with auto-resumed session ID
+        await sessionManager.getOrCreateSession(sess.project_name);
+        console.log(`Restored routing: chat ${sess.chat_id} → ${sess.project_name}`);
+      }
+
+      // Second pass: auto-continue only sessions that were actively running
       for (const sess of interruptedSessions) {
         try {
           // Send notification to chat
@@ -380,16 +399,13 @@ if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
             { parse_mode: "HTML" }
           );
 
-          // Restore the session in session manager
+          // Get the project session (already created in first pass)
           const projectSession = await sessionManager.getOrCreateSession(sess.project_name);
 
           if (sess.session_id) {
             const [success, message] = projectSession.session.resumeSession(sess.session_id);
             if (success) {
-              console.log(`Resumed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
-
-              // Track this chat's project
-              sessionManager.setLastUsed(sess.chat_id, sess.project_name);
+              console.log(`Auto-continuing session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
 
               // Automatically continue the session
               await autoContinueSession(projectSession, sess.chat_id, false);
