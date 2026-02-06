@@ -102,6 +102,44 @@ When running as a standalone binary (especially from a macOS app), the PATH may 
 
 Without this, `pdftotext` won't be found and PDF parsing will fail silently with an error message.
 
+## Long-Running Processes
+
+The bot supports automatic background process management for commands that might exceed the 180-second query timeout.
+
+### When to Use `long-run`
+
+- Simulations, optimizations, or solvers expected to take >60 seconds
+- Full test suites
+- Data processing or long builds
+
+### When NOT to Use `long-run`
+
+- Quick commands (<30 seconds)
+- Interactive commands (anything needing stdin)
+
+### How It Works
+
+1. Claude uses `long-run <command> [args...]` instead of running the command directly
+2. The command runs in a fully detached background process (immune to parent death)
+3. Claude's Bash tool returns immediately (no timeout risk)
+4. The bot's `ProcessMonitor` polls `/tmp/long-run/` every 5 seconds
+5. When the process completes, the bot notifies the user and auto-resumes Claude
+6. Claude reads the output log and delivers analysis
+
+### Key Files
+
+- **`scripts/long-run`** - Shell wrapper that detaches processes via `setsid`
+- **`src/process-monitor.ts`** - `ProcessMonitor` class polling for completions
+- **`src/config.ts`** - Safety prompt teaches Claude about `long-run`
+
+### Status Files
+
+Located in `/tmp/long-run/`:
+- `<id>.status` - JSON with process state (starting → running → completed)
+- `<id>.log` - stdout+stderr capture
+
+Files are automatically cleaned up after 24 hours.
+
 ## Commit Style
 
 Do not add "Generated with Claude Code" footers or "Co-Authored-By" trailers to commit messages.

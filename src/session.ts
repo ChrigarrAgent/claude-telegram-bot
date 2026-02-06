@@ -17,7 +17,7 @@ import {
   CLAUDE_CLI_PATH,
   MCP_SERVERS,
   QUERY_TIMEOUT_MS,
-  SAFETY_PROMPT,
+  SYSTEM_PROMPT,
   SESSION_FILE,
   STREAMING_THROTTLE_MS,
   TEMP_PATHS,
@@ -244,7 +244,7 @@ export class ClaudeSession {
       settingSources: ["user", "project"],
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
-      systemPrompt: SAFETY_PROMPT,
+      systemPrompt: SYSTEM_PROMPT,
       mcpServers: MCP_SERVERS,
       // Only include maxThinkingTokens when defined (undefined = SDK default = thinking OFF)
       ...(thinkingTokens !== undefined && { maxThinkingTokens: thinkingTokens }),

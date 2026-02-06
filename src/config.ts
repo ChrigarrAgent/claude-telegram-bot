@@ -15,6 +15,7 @@ const HOME = homedir();
 // Ensure necessary paths are available for Claude's bash commands
 // LaunchAgents don't inherit the full shell environment
 const EXTRA_PATHS = [
+  resolve(dirname(import.meta.dir), "scripts"), // Bot's scripts dir (long-run etc.)
   `${HOME}/.local/bin`,
   `${HOME}/.bun/bin`,
   "/opt/homebrew/bin",
@@ -201,6 +202,35 @@ You are running via Telegram, so the user cannot easily undo mistakes. Be extra 
 }
 
 export const SAFETY_PROMPT = buildSafetyPrompt(ALLOWED_PATHS);
+
+// ============== Workflow Prompt ==============
+
+// Workflow instructions separate from safety rules.
+// These teach Claude about available tools and patterns.
+// Kept composable so they can be adapted per agent backend (Claude Code, Codex, etc.).
+
+export const WORKFLOW_PROMPT = `
+LONG-RUNNING PROCESSES:
+When running commands expected to take more than 60 seconds (simulations,
+optimizations, full test suites, data processing, long builds), use the
+\`long-run\` wrapper command:
+  long-run <command> [args...]
+
+This runs the command in a detached background process and returns immediately.
+The bot will automatically notify you when it completes.
+
+After starting a long-run process, tell the user it's running in background.
+When you receive a completion notification, read the log file and continue.
+
+Do NOT use long-run for quick commands (<30s) or interactive commands.
+`;
+
+/**
+ * Compose all system prompt sections into a single string.
+ * Each section is a separate concern that can be conditionally included
+ * or adapted for different agent backends.
+ */
+export const SYSTEM_PROMPT = [SAFETY_PROMPT, WORKFLOW_PROMPT].join("\n");
 
 // Dangerous command patterns to block
 export const BLOCKED_PATTERNS = [

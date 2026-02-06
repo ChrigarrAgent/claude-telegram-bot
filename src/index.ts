@@ -34,6 +34,8 @@ import { scanAndGenerateAliases } from "./project-aliases";
 import type { ProjectSession } from "./project-session";
 import type { StatusCallback } from "./types";
 import { convertMarkdownToHtml } from "./formatting";
+import { processMonitor } from "./process-monitor";
+import type { LongRunStatus } from "./process-monitor";
 
 // Create bot instance
 const bot = new Bot(TELEGRAM_TOKEN);
@@ -122,6 +124,177 @@ async function autoContinueSession(
       );
     } catch {
       // Ignore if we can't even send error message
+    }
+  }
+}
+
+/**
+ * Handle completion of a long-running background process.
+ * Resolves the process CWD to a project, notifies the user, and sends
+ * a synthetic message to Claude to read the output log.
+ */
+async function handleProcessCompletion(status: LongRunStatus): Promise<void> {
+  try {
+    const { loadProjectAliases } = await import("./project-aliases");
+    const { getProjectAlias } = await import("./project-aliases");
+
+    const aliases = loadProjectAliases();
+
+    // Resolve CWD to project alias: exact match, then prefix match
+    let matchedAlias: string | null = null;
+    for (const [projectPath, alias] of Object.entries(aliases)) {
+      if (status.cwd === projectPath) {
+        matchedAlias = alias;
+        break;
+      }
+    }
+    if (!matchedAlias) {
+      for (const [projectPath, alias] of Object.entries(aliases)) {
+        if (status.cwd.startsWith(projectPath + "/")) {
+          matchedAlias = alias;
+          break;
+        }
+      }
+    }
+
+    if (!matchedAlias) {
+      console.warn(
+        `ProcessMonitor: No project found for CWD ${status.cwd}, skipping`
+      );
+      return;
+    }
+
+    const chatIds = sessionManager.getChatIdsForProject(matchedAlias);
+    if (chatIds.length === 0) {
+      console.warn(
+        `ProcessMonitor: No chats found for project ${matchedAlias}, skipping`
+      );
+      return;
+    }
+
+    const projectSession = sessionManager.getSession(matchedAlias);
+    if (!projectSession) {
+      console.warn(
+        `ProcessMonitor: No session found for project ${matchedAlias}, skipping`
+      );
+      return;
+    }
+
+    // If session is busy, retry after 10 seconds
+    if (projectSession.isRunning()) {
+      console.log(
+        `ProcessMonitor: Session ${matchedAlias} is busy, retrying in 10s`
+      );
+      setTimeout(() => handleProcessCompletion(status), 10_000);
+      return;
+    }
+
+    const exitLabel = status.exit_code === 0 ? "successfully" : `with exit code ${status.exit_code}`;
+    const projectAlias = getProjectAlias(projectSession.workingDir);
+
+    // Notify all chats for this project
+    for (const chatId of chatIds) {
+      try {
+        await bot.api.sendMessage(
+          chatId,
+          `<b>${projectAlias}:</b> Background process completed ${exitLabel}.\n` +
+            `<code>${status.command.trim()}</code>`,
+          { parse_mode: "HTML" }
+        );
+      } catch (e) {
+        console.error(
+          `ProcessMonitor: Failed to notify chat ${chatId}:`,
+          e
+        );
+      }
+    }
+
+    // Send synthetic message to Claude to read the log and continue
+    const primaryChatId = chatIds[0]!;
+    let currentMessage: any = null;
+
+    const statusCallback: StatusCallback = async (type, content, segmentId) => {
+      if (type === "text") {
+        const text = content || "";
+        const htmlText = convertMarkdownToHtml(text);
+        const prefixedText = `<b>${projectAlias}:</b> ${htmlText}`;
+
+        if (!currentMessage) {
+          currentMessage = await bot.api.sendMessage(
+            primaryChatId,
+            prefixedText,
+            { parse_mode: "HTML" }
+          );
+        } else {
+          try {
+            await bot.api.editMessageText(
+              primaryChatId,
+              currentMessage.message_id,
+              prefixedText,
+              { parse_mode: "HTML" }
+            );
+          } catch {
+            // Ignore edit failures
+          }
+        }
+      } else if (type === "tool") {
+        const toolContent = `<b>${projectAlias}:</b> ${content}`;
+        try {
+          await bot.api.sendMessage(primaryChatId, toolContent, {
+            parse_mode: "HTML",
+          });
+        } catch {
+          // Ignore send failures
+        }
+      }
+    };
+
+    const logFile = `/tmp/long-run/${status.id}.log`;
+    const prompt =
+      `A background process has completed ${exitLabel}.\n` +
+      `Command: ${status.command.trim()}\n` +
+      `Log file: ${logFile}\n\n` +
+      `Please read the log file and provide a summary of the results to the user.`;
+
+    await projectSession.sendMessage(
+      prompt,
+      "system",
+      0,
+      statusCallback,
+      primaryChatId,
+      undefined
+    );
+
+    console.log(
+      `ProcessMonitor: Handled completion of ${status.id} for project ${matchedAlias}`
+    );
+  } catch (error) {
+    console.error(`ProcessMonitor: Failed to handle completion:`, error);
+    // Try to send a fallback message
+    try {
+      const { loadProjectAliases } = await import("./project-aliases");
+      const aliases = loadProjectAliases();
+      let alias: string | null = null;
+      for (const [path, a] of Object.entries(aliases)) {
+        if (status.cwd === path || status.cwd.startsWith(path + "/")) {
+          alias = a;
+          break;
+        }
+      }
+      if (alias) {
+        const chatIds = sessionManager.getChatIdsForProject(alias);
+        for (const chatId of chatIds) {
+          await bot.api.sendMessage(
+            chatId,
+            `Background process completed but failed to auto-resume.\n` +
+              `Command: ${status.command.trim()}\n` +
+              `Exit code: ${status.exit_code}\n` +
+              `Log: /tmp/long-run/${status.id}.log`
+          );
+        }
+      }
+    } catch {
+      // Give up
     }
   }
 }
@@ -445,6 +618,9 @@ try {
   });
   console.log("Polling started successfully (concurrent mode)");
 
+  // Start monitoring for long-running process completions
+  processMonitor.start(handleProcessCompletion);
+
   // Monitor runner task for unexpected termination
   runner.task()?.then(() => {
     console.log("Runner stopped");
@@ -541,6 +717,9 @@ export async function saveActiveSessionsState(reason: "signal" | "restart"): Pro
 
 async function gracefulShutdown(signal: string): Promise<void> {
   console.log(`Received ${signal}`);
+
+  // Stop process monitor
+  processMonitor.stop();
 
   // Stop heartbeat
   clearInterval(heartbeatTimer);
