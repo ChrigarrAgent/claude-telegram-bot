@@ -311,21 +311,6 @@ class SessionManager {
     return Array.from(this.sessions.values()).map((s) => s.getStatus());
   }
 
-  /**
-   * Get current session (legacy compatibility).
-   * Returns the current project's session.
-   */
-  getCurrentSession(): ClaudeSession {
-    const projectSession = this.sessions.get(this.currentProject);
-    if (projectSession) {
-      return projectSession.session;
-    }
-
-    // Create default session synchronously for legacy compatibility
-    // This is a fallback - modern code should use getOrCreateSession()
-    const claudeSession = new ClaudeSession();
-    return claudeSession;
-  }
 }
 
 // Global singleton
@@ -343,10 +328,3 @@ export function resetSessionManager(): void {
   sessionManager["pendingQuestionsPerProject"].clear();
   sessionManager["currentProject"] = "default";
 }
-
-/**
- * Legacy compatibility export.
- * This allows old code using `import { session }` to continue working.
- * New code should use sessionManager directly.
- */
-export const session = sessionManager.getCurrentSession();

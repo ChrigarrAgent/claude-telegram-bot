@@ -10,7 +10,7 @@ import {
   type Options,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import type { Context } from "grammy";
 import {
   ALLOWED_PATHS,
@@ -91,6 +91,37 @@ function getTextFromMessage(msg: SDKMessage): string | null {
 // Maximum number of sessions to keep per project
 const SESSIONS_PER_PROJECT = 3;
 const DEFAULT_PROJECT_NAME = "default";
+
+/**
+ * Load session history from disk (standalone, no class instance needed).
+ */
+export function loadSessionHistory(): SessionHistory {
+  try {
+    if (!existsSync(SESSION_FILE)) {
+      return { sessions: [] };
+    }
+
+    const text = readFileSync(SESSION_FILE, "utf-8");
+    return JSON.parse(text) as SessionHistory;
+  } catch {
+    return { sessions: [] };
+  }
+}
+
+/**
+ * Get saved sessions list (standalone, no class instance needed).
+ */
+export function getSavedSessionList(filterByProject?: string): SavedSession[] {
+  const history = loadSessionHistory();
+
+  if (filterByProject !== undefined) {
+    return history.sessions.filter(
+      (s) => s.project === filterByProject || s.working_dir === filterByProject
+    );
+  }
+
+  return history.sessions;
+}
 
 export class ClaudeSession {
   sessionId: string | null = null;
@@ -732,7 +763,7 @@ export class ClaudeSession {
 
     try {
       // Load existing session history
-      const history = this.loadSessionHistory();
+      const history = loadSessionHistory();
 
       // Create new session entry with project name
       const workDir = overrideWorkingDir || getWorkingDir();
@@ -760,27 +791,10 @@ export class ClaudeSession {
       this.trimSessionHistory(history);
 
       // Save
-      Bun.write(SESSION_FILE, JSON.stringify(history, null, 2));
+      writeFileSync(SESSION_FILE, JSON.stringify(history, null, 2), "utf-8");
       console.log(`Session saved to ${SESSION_FILE}`);
     } catch (error) {
       console.warn(`Failed to save session: ${error}`);
-    }
-  }
-
-  /**
-   * Load session history from disk.
-   */
-  private loadSessionHistory(): SessionHistory {
-    try {
-      const file = Bun.file(SESSION_FILE);
-      if (!file.size) {
-        return { sessions: [] };
-      }
-
-      const text = readFileSync(SESSION_FILE, "utf-8");
-      return JSON.parse(text) as SessionHistory;
-    } catch {
-      return { sessions: [] };
     }
   }
 
@@ -789,24 +803,14 @@ export class ClaudeSession {
    * @param filterByProject - Optional project name to filter by (if undefined, returns all sessions)
    */
   getSessionList(filterByProject?: string): SavedSession[] {
-    const history = this.loadSessionHistory();
-
-    // If filter specified, return only sessions for that project
-    if (filterByProject !== undefined) {
-      return history.sessions.filter(
-        (s) => s.project === filterByProject || s.working_dir === filterByProject
-      );
-    }
-
-    // Return ALL sessions (no filtering)
-    return history.sessions;
+    return getSavedSessionList(filterByProject);
   }
 
   /**
    * Resume a specific session by ID.
    */
   resumeSession(sessionId: string): [success: boolean, message: string] {
-    const history = this.loadSessionHistory();
+    const history = loadSessionHistory();
     const sessionData = history.sessions.find((s) => s.session_id === sessionId);
 
     if (!sessionData) {
@@ -845,5 +849,3 @@ export class ClaudeSession {
   }
 }
 
-// Global session instance
-export const session = new ClaudeSession();

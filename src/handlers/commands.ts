@@ -5,9 +5,9 @@
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
+import { getSavedSessionList } from "../session";
 import { sessionManager } from "../session-manager";
-import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, getWorkingDir, setWorkingDir, resolveProjectPath } from "../config";
+import { ALLOWED_USERS, RESTART_FILE, getWorkingDir, setWorkingDir, resolveProjectPath } from "../config";
 import { isAuthorized } from "../security";
 import { getProjectAlias, getOrCreateProjectAlias, getAliasToPathMap, getProjectByAlias } from "../project-aliases";
 
@@ -22,7 +22,10 @@ export async function handleStart(ctx: Context): Promise<void> {
     return;
   }
 
-  const status = session.isActive ? "Active session" : "No active session";
+  const chatId = ctx.chat?.id;
+  const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+  const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+  const status = projectSession?.isActive() ? "Active session" : "No active session";
   const workDir = getWorkingDir();
   const projectAlias = getProjectAlias(workDir);
 
@@ -98,16 +101,7 @@ export async function handleNew(ctx: Context): Promise<void> {
 
     await ctx.reply(`🆕 Session cleared for <b>${projectAlias}</b>. Next message starts fresh.`, { parse_mode: "HTML" });
   } else {
-    // Fallback to global session for backwards compatibility
-    if (session.isRunning) {
-      const result = await session.stop();
-      if (result) {
-        await Bun.sleep(100);
-        session.clearStopRequested();
-      }
-    }
-    await session.kill();
-    await ctx.reply("🆕 Session cleared. Next message starts fresh.");
+    await ctx.reply("🆕 No active session. Next message starts fresh.");
   }
 }
 
@@ -132,14 +126,6 @@ export async function handleStop(ctx: Context): Promise<void> {
     if (result) {
       await Bun.sleep(100);
       projectSession.session.clearStopRequested();
-    }
-    // Silent stop - no message shown
-  } else if (session.isRunning) {
-    // Fallback to global session
-    const result = await session.stop();
-    if (result) {
-      await Bun.sleep(100);
-      session.clearStopRequested();
     }
   }
   // If nothing running, stay silent
@@ -239,7 +225,7 @@ export async function handleResume(ctx: Context): Promise<void> {
   }
 
   // Get ALL saved sessions (cross-project)
-  const allSessions = session.getSessionList(); // No filter = all sessions
+  const allSessions = getSavedSessionList();
 
   if (allSessions.length === 0) {
     await ctx.reply("❌ No saved sessions.");
@@ -382,7 +368,11 @@ export async function handleHandoff(ctx: Context): Promise<void> {
     return;
   }
 
-  if (!session.isActive) {
+  const chatId = ctx.chat?.id;
+  const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+  const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+
+  if (!projectSession?.isActive()) {
     await ctx.reply(
       "❌ No active session.\n\n" +
         "Start a conversation first, then use /handoff to take over in SSH."
@@ -390,8 +380,7 @@ export async function handleHandoff(ctx: Context): Promise<void> {
     return;
   }
 
-  const sessionId = session.sessionId!;
-  const shortId = sessionId.slice(0, 8);
+  const sessionId = projectSession.session.sessionId!;
 
   // Create a simple command the user can run after SSH
   await ctx.reply(
@@ -416,8 +405,13 @@ export async function handleTmux(ctx: Context): Promise<void> {
     return;
   }
 
+  const chatId = ctx.chat?.id;
+  const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+  const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+
   const tmuxSession = "claude-shared";
-  const sessionArg = session.isActive ? ` --resume ${session.sessionId}` : "";
+  const sessionArg = projectSession?.isActive() ? ` --resume ${projectSession.session.sessionId}` : "";
+  const workDir = projectSession?.workingDir || getWorkingDir();
 
   await ctx.reply(
     `🖥️ <b>tmux Session</b>\n\n` +
@@ -426,8 +420,8 @@ export async function handleTmux(ctx: Context): Promise<void> {
       `<b>Send command from Telegram:</b>\n` +
       `<code>tmux send-keys -t ${tmuxSession} "your message" Enter</code>\n\n` +
       `<b>Current state:</b>\n` +
-      `• Telegram session: ${session.isActive ? "Active" : "None"}\n` +
-      `• Working dir: <code>${WORKING_DIR}</code>`,
+      `• Telegram session: ${projectSession?.isActive() ? "Active" : "None"}\n` +
+      `• Working dir: <code>${workDir}</code>`,
     { parse_mode: "HTML" }
   );
 }
@@ -832,7 +826,7 @@ export async function handleRetry(ctx: Context): Promise<void> {
   // Get project-specific session
   const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
   const projectSession = projectName ? sessionManager.getSession(projectName) : null;
-  const lastMessage = projectSession?.session.lastMessage || session.lastMessage;
+  const lastMessage = projectSession?.session.lastMessage || null;
 
   // Check if there's a message to retry
   if (!lastMessage) {
@@ -841,7 +835,7 @@ export async function handleRetry(ctx: Context): Promise<void> {
   }
 
   // Check if something is already running
-  const isRunning = projectSession?.isRunning() || session.isRunning;
+  const isRunning = projectSession?.isRunning() || false;
   if (isRunning) {
     await ctx.reply("⏳ A query is already running. Use /stop first.");
     return;

@@ -355,15 +355,25 @@ pm2 logs claude-telegram-bot --lines 200 --nostream 2>&1 | grep -E "Error|error|
 
 ### Handler Consistency
 
-**IMPORTANT**: All message handlers (text, voice, photo, document) must use `sessionManager` for multi-project support. The global `session` export exists only for legacy compatibility.
+**IMPORTANT**: There is no global `session` singleton. All handlers must resolve the project session via `sessionManager`:
 
 ```typescript
-// CORRECT - use sessionManager
+// CORRECT - resolve session from chat context
+const chatId = ctx.chat?.id;
+const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+
+// For sending messages (creates session if needed)
 const projectSession = await sessionManager.getOrCreateSession(projectName);
 await projectSession.sendMessage(message, ...);
+```
 
-// WRONG - bypasses multi-project routing
-await session.sendMessageStreaming(message, ...);
+To read saved sessions from disk without a class instance, use the standalone function:
+
+```typescript
+import { getSavedSessionList } from "../session";
+const allSessions = getSavedSessionList();               // all sessions
+const filtered = getSavedSessionList("my-project");      // by project
 ```
 
 ### Path Validation Pattern
@@ -395,6 +405,26 @@ To verify session resume is working:
 4. Check logs for: `Auto-resumed session for <project>: abc123...`
 
 If you see `STARTING new Claude session` instead of `Auto-resumed`, the resume logic isn't working.
+
+## Refactoring Learnings
+
+### No Global Session Singletons
+
+The codebase previously had a `session` singleton (`export const session = new ClaudeSession()`) in both `session.ts` and `session-manager.ts`. This caused `/handoff`, `/tmux`, `/retry`, `/start`, `/new`, and `/stop` to operate on a disconnected `ClaudeSession` that was never used for actual queries. The fix was to remove all singletons and resolve sessions through `sessionManager` using the chat-to-project mapping.
+
+**Rule**: Never create a standalone `ClaudeSession` for command handlers. Always resolve via `sessionManager.getLastUsed(chatId)` + `sessionManager.getSession(projectName)`.
+
+### Prefer Standalone Functions Over Throwaway Instances
+
+When you only need to read data (like the session history file), don't instantiate a whole class. Extract the logic into a standalone exported function (`getSavedSessionList()`, `loadSessionHistory()`) that any caller can use without side effects.
+
+### Sync File I/O for Shared State
+
+`saveSession()` used `Bun.write()` (async, fire-and-forget) while `loadSessionHistory()` used `readFileSync()`. With multiple concurrent project sessions, this caused race conditions where one session's write hadn't flushed before another's read. Fix: use `writeFileSync()` for shared state files like session persistence. Async writes are fine for logs or temp files, not for state that's read back immediately.
+
+### `Bun.file().size` vs `existsSync()`
+
+`Bun.file(path).size` throws or returns 0 for missing files depending on the Bun version — it's unreliable as an existence check. Use `existsSync()` from Node's `fs` module instead.
 
 ## Running on Ubuntu Server (PM2)
 

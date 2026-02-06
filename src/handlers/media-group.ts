@@ -11,7 +11,7 @@ import type { PendingMediaGroup } from "../types";
 import { MEDIA_GROUP_TIMEOUT } from "../config";
 import { rateLimiter } from "../security";
 import { auditLogRateLimit } from "../utils";
-import { session } from "../session";
+import type { ClaudeSession } from "../session";
 
 /**
  * Configuration for a media group handler.
@@ -178,7 +178,8 @@ export function createMediaGroupBuffer(config: MediaGroupConfig) {
 export async function handleProcessingError(
   ctx: Context,
   error: unknown,
-  toolMessages: Message[]
+  toolMessages: Message[],
+  claudeSession?: ClaudeSession
 ): Promise<void> {
   console.error("Error processing media:", error);
 
@@ -195,7 +196,7 @@ export async function handleProcessingError(
   const errorStr = String(error);
   if (errorStr.includes("abort") || errorStr.includes("cancel")) {
     // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
-    const wasInterrupt = session.consumeInterruptFlag();
+    const wasInterrupt = claudeSession?.consumeInterruptFlag() ?? false;
     if (!wasInterrupt) {
       await ctx.reply("🛑 Query stopped.");
     }

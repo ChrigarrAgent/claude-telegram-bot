@@ -6,7 +6,6 @@
 
 import type { Context } from "grammy";
 import { unlinkSync } from "fs";
-import { session } from "../session";
 import { sessionManager } from "../session-manager";
 import { ALLOWED_USERS, setWorkingDir, resolveProjectPath } from "../config";
 import { isAuthorized } from "../security";

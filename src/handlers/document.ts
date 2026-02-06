@@ -10,7 +10,7 @@ import { basename, extname } from "path";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit } from "../utils";
-import { createMediaGroupBuffer, handleProcessingError } from "./media-group";
+import { createMediaGroupBuffer } from "./media-group";
 import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 // Supported text file extensions
