@@ -7,7 +7,7 @@
 import type { Context } from "grammy";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
-import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
+import { auditLog, auditLogRateLimit } from "../utils";
 import { createMediaGroupBuffer } from "./media-group";
 import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
 
@@ -57,7 +57,6 @@ async function processPhotos(
 ): Promise<void> {
   const projectSession = await getSessionForChat(chatId);
   const stopProcessing = projectSession.session.startProcessing();
-  const typing = startTypingIndicator(ctx);
 
   // Build prompt
   let prompt: string;
@@ -96,7 +95,6 @@ async function processPhotos(
     await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
-    typing.stop();
   }
 }
 

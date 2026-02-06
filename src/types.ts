@@ -107,3 +107,33 @@ export interface HeartbeatData {
   last_heartbeat: string;
   sessions: ActiveSessionEntry[];
 }
+
+// AskUserQuestion types (for GSD and similar plugins)
+export interface AskUserQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface AskUserQuestion {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: AskUserQuestionOption[];
+}
+
+export interface AskUserQuestionInput {
+  questions: AskUserQuestion[];
+}
+
+export interface PendingAskUserQuestion {
+  requestId: string;
+  projectName: string;
+  chatId: number;
+  messageIds: number[];
+  questions: AskUserQuestion[];
+  currentQuestionIndex: number;
+  selectedIndices: Map<number, Set<number>>; // questionIndex → selected option indices
+  awaitingFreeText: boolean;
+  createdAt: Date;
+  expiresAt: Date;
+}

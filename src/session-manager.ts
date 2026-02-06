@@ -6,6 +6,7 @@
  */
 
 import type { ProjectSession } from "./project-session";
+import type { PendingAskUserQuestion } from "./types";
 import { ClaudeSession } from "./session";
 import { resolveProjectPath } from "./config";
 
@@ -37,6 +38,7 @@ class SessionManager {
   private lastUsedPerChat = new Map<number, string>();
   private chatsByProject = new Map<string, Set<number>>(); // Reverse index for O(1) lookup
   private pendingClonePerChat = new Map<number, PendingClone>();
+  private pendingQuestionsPerProject = new Map<string, PendingAskUserQuestion>();
   private currentProject: string = "default";
 
   /**
@@ -77,15 +79,18 @@ class SessionManager {
 
     // CRITICAL: Auto-resume persisted session for this project
     // This ensures continuity when bot restarts or sessions are recreated
-    const savedSessions = claudeSession.getSessionList(projectName);
-    if (savedSessions.length > 0) {
-      const mostRecent = savedSessions[0]!;
-      // Only resume if it's for the same working directory
-      if (mostRecent.working_dir === workingDir || mostRecent.project === projectName) {
-        claudeSession.sessionId = mostRecent.session_id;
-        claudeSession.conversationTitle = mostRecent.title;
-        claudeSession["_resumeAttempted"] = true; // Track for validation on first message
-        console.log(`Auto-resumed session for ${projectName}: ${mostRecent.session_id.slice(0, 8)}...`);
+    // Skip auto-resume in test environment to ensure clean state
+    if (process.env.NODE_ENV !== "test") {
+      const savedSessions = claudeSession.getSessionList(projectName);
+      if (savedSessions.length > 0) {
+        const mostRecent = savedSessions[0]!;
+        // Only resume if it's for the same working directory
+        if (mostRecent.working_dir === workingDir || mostRecent.project === projectName) {
+          claudeSession.sessionId = mostRecent.session_id;
+          claudeSession.conversationTitle = mostRecent.title;
+          claudeSession["_resumeAttempted"] = true; // Track for validation on first message
+          console.log(`Auto-resumed session for ${projectName}: ${mostRecent.session_id.slice(0, 8)}...`);
+        }
       }
     }
 
@@ -198,6 +203,98 @@ class SessionManager {
   }
 
   /**
+   * Set pending AskUserQuestion for a project.
+   * Stored per-project to support concurrent sessions.
+   */
+  setPendingQuestion(projectName: string, question: PendingAskUserQuestion): void {
+    this.pendingQuestionsPerProject.set(projectName, question);
+  }
+
+  /**
+   * Get pending AskUserQuestion for a chat.
+   * Looks up by project name if provided, otherwise by chat's last-used project.
+   */
+  getPendingQuestion(chatId: number, projectName?: string): PendingAskUserQuestion | null {
+    // If project name provided, look up directly
+    if (projectName) {
+      const pending = this.pendingQuestionsPerProject.get(projectName);
+      if (pending && pending.chatId === chatId) {
+        // Check expiration
+        if (new Date() > pending.expiresAt) {
+          this.pendingQuestionsPerProject.delete(projectName);
+          return null;
+        }
+        return pending;
+      }
+      return null;
+    }
+
+    // Otherwise look up by chat's last-used project
+    const lastUsedProject = this.lastUsedPerChat.get(chatId);
+    if (lastUsedProject) {
+      const pending = this.pendingQuestionsPerProject.get(lastUsedProject);
+      if (pending && pending.chatId === chatId) {
+        // Check expiration
+        if (new Date() > pending.expiresAt) {
+          this.pendingQuestionsPerProject.delete(lastUsedProject);
+          return null;
+        }
+        return pending;
+      }
+    }
+
+    // Fallback: search all pending questions for this chat
+    for (const [projName, pending] of this.pendingQuestionsPerProject) {
+      if (pending.chatId === chatId) {
+        // Check expiration
+        if (new Date() > pending.expiresAt) {
+          this.pendingQuestionsPerProject.delete(projName);
+          continue;
+        }
+        return pending;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Clear pending AskUserQuestion for a project.
+   */
+  clearPendingQuestion(projectName: string): void {
+    this.pendingQuestionsPerProject.delete(projectName);
+  }
+
+  /**
+   * Toggle selection for multi-select questions.
+   * Returns the updated set of selected indices.
+   */
+  updateQuestionSelection(
+    projectName: string,
+    questionIndex: number,
+    optionIndex: number
+  ): Set<number> | null {
+    const pending = this.pendingQuestionsPerProject.get(projectName);
+    if (!pending) return null;
+
+    // Get or create the selection set for this question
+    if (!pending.selectedIndices.has(questionIndex)) {
+      pending.selectedIndices.set(questionIndex, new Set());
+    }
+
+    const selections = pending.selectedIndices.get(questionIndex)!;
+
+    // Toggle selection
+    if (selections.has(optionIndex)) {
+      selections.delete(optionIndex);
+    } else {
+      selections.add(optionIndex);
+    }
+
+    return selections;
+  }
+
+  /**
    * Get status for a specific project.
    */
   getSessionStatus(projectName: string): SessionStatus | null {
@@ -243,6 +340,7 @@ export function resetSessionManager(): void {
   sessionManager["lastUsedPerChat"].clear();
   sessionManager["chatsByProject"].clear();
   sessionManager["pendingClonePerChat"].clear();
+  sessionManager["pendingQuestionsPerProject"].clear();
   sessionManager["currentProject"] = "default";
 }
 

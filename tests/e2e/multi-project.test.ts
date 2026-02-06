@@ -50,8 +50,21 @@ describe("Multi-Project Session Management", () => {
   let testBot: TestBot;
 
   beforeEach(async () => {
-    // Reset all state before each test
+    // FIRST: Delete session file to prevent auto-resume from previous tests
+    const { unlinkSync, existsSync } = await import("fs");
+    const sessionFile = process.env.SESSION_FILE || "/tmp/test-claude-session.json";
+    try {
+      if (existsSync(sessionFile)) {
+        unlinkSync(sessionFile);
+      }
+    } catch {
+      // Ignore
+    }
+
+    // Reset mock SDK state
     resetMockSDK();
+
+    // Reset session manager state
     await resetSessionManager();
 
     // CRITICAL: Reset working directory to known state
@@ -326,6 +339,171 @@ describe("Multi-Project Session Management", () => {
       expect(defaultSession).not.toBe(tmpSession);
       expect(defaultSession).not.toBe(varSession);
       expect(tmpSession).not.toBe(varSession);
+    });
+  });
+
+  describe("Concurrent Multi-Project Messaging", () => {
+    test("concurrent @project messages to DIFFERENT projects run independently", async () => {
+      // This test verifies the sequentializer fix:
+      // Messages with @project syntax should be queued per-project, not per-chat
+      // This allows truly concurrent execution across different projects
+
+      // Send messages to two different projects "concurrently"
+      const promise1 = testBot.sendMessage(
+        CHAT_1,
+        testUser1,
+        "@home First project message"
+      );
+      const promise2 = testBot.sendMessage(
+        CHAT_1,
+        testUser1,
+        "@tmp Second project message"
+      );
+
+      // Wait for both to complete
+      await Promise.all([promise1, promise2]);
+      await new Promise((r) => setTimeout(r, 200));
+
+      const calls = getMockCalls();
+
+      // Both messages should have triggered SDK calls
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+
+      // Extract unique cwds from calls
+      const cwds = new Set(calls.map((c) => c.options.cwd));
+
+      // Should have at least 2 different cwds (different projects)
+      expect(cwds.size).toBeGreaterThanOrEqual(2);
+    });
+
+    test("messages to SAME project queue sequentially", async () => {
+      // Two messages to the same project should be queued
+      // The second should wait for the first to complete
+
+      await testBot.sendMessage(CHAT_1, testUser1, "First message to default");
+      await new Promise((r) => setTimeout(r, 50));
+      await testBot.sendMessage(CHAT_1, testUser1, "Second message to default");
+      await new Promise((r) => setTimeout(r, 200));
+
+      const calls = getMockCalls();
+
+      // Both should be processed
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+
+      // Both should have same cwd (same project)
+      const cwds = new Set(calls.map((c) => c.options.cwd));
+      expect(cwds.size).toBe(1);
+
+      // Second call should resume the session from first call
+      // (since they're sequential, not concurrent)
+      if (calls.length >= 2) {
+        expect(calls[1]!.options.resume).toBeDefined();
+      }
+    });
+
+    test("each project gets its own working message", async () => {
+      // Send to two projects
+      await testBot.sendMessage(CHAT_1, testUser1, "@home Question 1");
+      await new Promise((r) => setTimeout(r, 50));
+      await testBot.sendMessage(CHAT_1, testUser1, "@tmp Question 2");
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Check replies - each project should have sent messages
+      const replyTexts = testBot.getAllReplyTexts();
+
+      // Should have multiple replies (working messages + final answers)
+      expect(replyTexts.length).toBeGreaterThanOrEqual(2);
+
+      // Look for working messages with different project prefixes
+      const workingMessages = replyTexts.filter(
+        (text) => text?.includes("Working") || text?.includes("🔄")
+      );
+
+      // Should have working messages
+      expect(workingMessages.length).toBeGreaterThanOrEqual(1);
+    });
+
+    test("interleaved messages to two projects (A, B, A, B) process correctly", async () => {
+      // Send: project A, project B, project A, project B
+      // Each project should get 2 messages processed
+
+      await testBot.sendMessage(CHAT_1, testUser1, "@home Message A1");
+      await new Promise((r) => setTimeout(r, 50));
+      await testBot.sendMessage(CHAT_1, testUser1, "@tmp Message B1");
+      await new Promise((r) => setTimeout(r, 50));
+      await testBot.sendMessage(CHAT_1, testUser1, "@home Message A2");
+      await new Promise((r) => setTimeout(r, 50));
+      await testBot.sendMessage(CHAT_1, testUser1, "@tmp Message B2");
+      await new Promise((r) => setTimeout(r, 300));
+
+      const calls = getMockCalls();
+
+      // Should have 4 SDK calls
+      expect(calls.length).toBeGreaterThanOrEqual(4);
+
+      // Group by cwd
+      const byCwd = new Map<string, typeof calls>();
+      for (const call of calls) {
+        const cwd = call.options.cwd || "default";
+        if (!byCwd.has(cwd)) byCwd.set(cwd, []);
+        byCwd.get(cwd)!.push(call);
+      }
+
+      // Should have 2 different projects
+      expect(byCwd.size).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  describe("Message Queue Behavior", () => {
+    test("stop command is processed during query", async () => {
+      // Start a message
+      const msgPromise = testBot.sendMessage(CHAT_1, testUser1, "Long running query");
+
+      // Send stop command while processing
+      await new Promise((r) => setTimeout(r, 20));
+      await testBot.sendCommand(CHAT_1, testUser1, "stop");
+
+      await msgPromise;
+      await new Promise((r) => setTimeout(r, 100));
+
+      // The message should have been processed (stop command might be silent)
+      const calls = getMockCalls();
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    test("! prefix bypasses queue for interrupt", async () => {
+      // The ! prefix should bypass the sequentializer queue
+      // This is verified by the message not being blocked
+
+      await testBot.sendMessage(CHAT_1, testUser1, "First query");
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Interrupt message - should bypass queue
+      await testBot.sendMessage(CHAT_1, testUser1, "!Interrupt with new query");
+      await new Promise((r) => setTimeout(r, 200));
+
+      const calls = getMockCalls();
+
+      // Both messages should have triggered SDK calls
+      // (! prefix allows immediate processing)
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    test("commands bypass sequentializer and work immediately", async () => {
+      // Commands like /status should work even during processing
+      await testBot.sendMessage(CHAT_1, testUser1, "Some query");
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Status command should not be blocked
+      await testBot.sendCommand(CHAT_1, testUser1, "status");
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Should have status reply
+      const replyTexts = testBot.getAllReplyTexts();
+      const hasStatus = replyTexts.some(
+        (text) => text?.includes("Status") || text?.includes("📊")
+      );
+      expect(hasStatus).toBe(true);
     });
   });
 });

@@ -9,7 +9,7 @@ import type { Context } from "grammy";
 import { basename, extname } from "path";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
-import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
+import { auditLog, auditLogRateLimit } from "../utils";
 import { createMediaGroupBuffer, handleProcessingError } from "./media-group";
 import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
 
@@ -232,7 +232,6 @@ async function processArchive(
 ): Promise<void> {
   const projectSession = await getSessionForChat(chatId);
   const stopProcessing = projectSession.session.startProcessing();
-  const typing = startTypingIndicator(ctx);
 
   // Show extraction progress
   const statusMsg = await ctx.reply(`📦 Extracting <b>${fileName}</b>...`, {
@@ -322,7 +321,6 @@ async function processArchive(
       }
     }
     stopProcessing();
-    typing.stop();
   }
 }
 
@@ -339,7 +337,6 @@ async function processDocuments(
 ): Promise<void> {
   const projectSession = await getSessionForChat(chatId);
   const stopProcessing = projectSession.session.startProcessing();
-  const typing = startTypingIndicator(ctx);
 
   // Build prompt
   let prompt: string;
@@ -389,7 +386,6 @@ async function processDocuments(
     await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
-    typing.stop();
   }
 }
 

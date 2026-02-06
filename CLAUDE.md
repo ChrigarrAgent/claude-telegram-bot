@@ -192,13 +192,89 @@ if (errorStr.includes("exited with code") && attempt < MAX_RETRIES) {
 
 **Symptom**: `GrammyError: 409: Conflict: terminated by other getUpdates request`
 
-**Cause**: Multiple bot instances running simultaneously
+**Cause**: Multiple bot instances running simultaneously. This happens when:
+1. A process started outside PM2 (e.g., `bun run start` in terminal) is still running
+2. PM2 crashed but left orphan bun processes
+3. Bot was started manually while PM2 instance was running
+4. Previous PM2 delete didn't kill the actual process
 
-**Fix**: Kill all stray processes before starting:
+**Diagnosis**:
 ```bash
-pm2 kill
-pkill -f "bun.*claude-telegram-bot"
-pm2 start ecosystem.config.js
+# Check PM2 status
+pm2 status
+
+# Check actual running processes (should match PM2 pid)
+pgrep -af "bun.*claude"
+
+# If PM2 shows pid X but pgrep shows pid Y, you have a stale process
+```
+
+**Fix**: Kill ALL processes before restarting:
+```bash
+# Full cleanup
+pm2 delete claude-telegram-bot 2>/dev/null
+pkill -9 -f "bun.*claude-telegram-bot"
+sleep 2
+
+# Verify clean
+pgrep -af "bun.*claude"  # Should show nothing
+
+# Start fresh
+pm2 start bun --name claude-telegram-bot -- run start
+```
+
+**Prevention**: Always use PM2 to manage the bot. Never run `bun run start` directly on the server.
+
+### Issue: Project switching uses wrong directory
+
+**Symptom**: After switching projects via `/projects` or `@project` syntax, Claude runs in the wrong directory (e.g., `/home/ubuntu` instead of the project path)
+
+**Cause**: Code was storing the **folder name** (e.g., `ExMasCommuter`) in `lastUsedPerChat` instead of the **alias** (e.g., `exmas-commuter`). When `resolveProjectPath()` later tries to look up `ExMasCommuter`, it can't find it because aliases are lowercase and different from folder names.
+
+**How it happens**:
+```typescript
+// WRONG - extracts folder name from path
+const projName = projectPath.split("/").pop();  // "ExMasCommuter"
+sessionManager.setLastUsed(chatId, projName);
+// Later: resolveProjectPath("ExMasCommuter") fails to find alias
+
+// CORRECT - use the alias directly
+const projName = projectAlias.toLowerCase();  // "exmas-commuter"
+sessionManager.setLastUsed(chatId, projName);
+// Later: resolveProjectPath("exmas-commuter") finds the alias
+```
+
+**Key insight**: The alias file maps `path → alias`:
+```json
+{
+  "/home/ubuntu/Projects/ExMasCommuter": "exmas-commuter",
+  "/home/ubuntu/Projects/resort_ranger": "resort-ranger"
+}
+```
+
+The `resolveProjectPath()` function looks up by alias, not folder name. So `lastUsed` must store the alias.
+
+**Fix**: In all project switching code (`callback.ts`, `text.ts`), use the alias for session tracking:
+```typescript
+// In callback.ts handleProjectCallback() and handleAskUserQuestionCallback()
+const projName = projectName.toLowerCase();  // projectName IS the alias
+sessionManager.setLastUsed(chatId, projName);
+
+// In text.ts @project handling
+const projName = projectAlias!.toLowerCase();  // Use the alias, not folder name
+sessionManager.setLastUsed(chatId, projName);
+```
+
+**Debug logging**: Look for these log lines to trace project switching:
+```bash
+pm2 logs claude-telegram-bot --lines 100 --nostream 2>&1 | grep -E "\[PROJECT-SWITCH\]|\[getProjectNameForChat\]|\[SESSION\] cwd"
+```
+
+Expected output when working correctly:
+```
+[PROJECT-SWITCH] Set lastUsed for chatId=123 to projName=exmas-commuter (alias)
+[getProjectNameForChat] chatId=123, lastUsed=exmas-commuter
+[SESSION] cwd being passed to SDK: /home/ubuntu/Projects/ExMasCommuter
 ```
 
 ## Debugging Tips

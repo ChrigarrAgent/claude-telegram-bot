@@ -41,6 +41,17 @@ describe("Session Continuity", () => {
   let testBot: TestBot;
 
   beforeEach(async () => {
+    // FIRST: Delete session file to prevent auto-resume from previous tests
+    const { unlinkSync, existsSync } = await import("fs");
+    const sessionFile = process.env.SESSION_FILE || "/tmp/test-claude-session.json";
+    try {
+      if (existsSync(sessionFile)) {
+        unlinkSync(sessionFile);
+      }
+    } catch {
+      // Ignore
+    }
+
     // Reset all state before each test
     resetMockSDK();
     await resetSessionManager();

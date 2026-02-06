@@ -330,9 +330,11 @@ describe("Project Resolution", () => {
     expect(path).toContain("/test");
   });
 
-  test("falls back to Projects directory for unknown names", () => {
-    const path = resolveProjectPath("unknown-project");
-    expect(path).toContain("/home/ubuntu/Projects/unknown-project");
+  test("falls back to HOME for unknown names (safe fallback)", () => {
+    // resolveProjectPath now falls back to HOME instead of returning non-existent paths
+    // This prevents the SDK from failing silently with invalid cwd
+    const path = resolveProjectPath("unknown-project-xyz");
+    expect(path).toBe("/home/ubuntu");
   });
 });
 

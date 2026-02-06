@@ -25,9 +25,20 @@ export async function getTestBot() {
 }
 
 /**
- * Reset session manager state
+ * Reset session manager state and clear persisted session file
  */
 export async function resetSessionManager() {
   const { resetSessionManager: reset } = await import("../../src/session-manager");
   reset();
+
+  // Also delete the session file to prevent auto-resume
+  const { unlinkSync, existsSync } = await import("fs");
+  const sessionFile = process.env.SESSION_FILE || "/tmp/test-claude-session.json";
+  try {
+    if (existsSync(sessionFile)) {
+      unlinkSync(sessionFile);
+    }
+  } catch {
+    // Ignore if file doesn't exist
+  }
 }

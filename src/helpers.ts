@@ -16,10 +16,13 @@ import { getProjectAlias } from "./project-aliases";
  */
 export function getProjectNameForChat(chatId: number): string {
   const lastUsed = sessionManager.getLastUsed(chatId);
+  console.log(`[getProjectNameForChat] chatId=${chatId}, lastUsed=${lastUsed}`);
   if (lastUsed) return lastUsed;
 
   const pathParts = getWorkingDir().split("/");
-  return pathParts[pathParts.length - 1] || "default";
+  const fallback = pathParts[pathParts.length - 1] || "default";
+  console.log(`[getProjectNameForChat] No lastUsed, falling back to: ${fallback}`);
+  return fallback;
 }
 
 /**

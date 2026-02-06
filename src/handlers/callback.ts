@@ -14,6 +14,12 @@ import { auditLog, startTypingIndicator } from "../utils";
 import { StreamingState, createStatusCallback } from "./streaming";
 import { updateSafetyRequest } from "./safety-confirmation";
 import { getProjectByAlias, getProjectAlias } from "../project-aliases";
+import {
+  formatQuestionMessage,
+  createQuestionKeyboard,
+  formatSelectionsForClaude,
+} from "./ask-user-question";
+import { escapeHtml } from "../formatting";
 
 /**
  * Handle callback queries from inline keyboards.
@@ -50,6 +56,12 @@ export async function handleCallback(ctx: Context): Promise<void> {
   // 3. Handle safety confirmation callbacks: safety:{request_id}:allow|deny
   if (callbackData.startsWith("safety:")) {
     await handleSafetyCallback(ctx, callbackData);
+    return;
+  }
+
+  // 3.5. Handle AskUserQuestion callbacks: askuserq:{request_id}:{question_index}:{action}
+  if (callbackData.startsWith("askuserq:")) {
+    await handleAskUserQuestionCallback(ctx, callbackData, userId, username);
     return;
   }
 
@@ -320,15 +332,16 @@ async function handleProjectCallback(
   if (action === "switch" && projectName) {
     // Look up the project path from alias
     const projectPath = getProjectByAlias(projectName);
+    console.log(`[PROJECT-SWITCH] Alias: ${projectName}, resolved path: ${projectPath}`);
 
     if (!projectPath) {
       await ctx.answerCallbackQuery({ text: "Project not found", show_alert: true });
       return;
     }
 
-    // Extract project name from path for session manager
-    const pathParts = projectPath.split("/");
-    const projName = pathParts[pathParts.length - 1] || "default";
+    // IMPORTANT: Use the ALIAS (projectName) for session tracking, not the folder name!
+    // This ensures consistency - the alias is what resolveProjectPath() can look up.
+    const projName = projectName.toLowerCase();
 
     // Switch to the project
     setWorkingDir(projectPath);
@@ -336,6 +349,7 @@ async function handleProjectCallback(
 
     if (chatId) {
       sessionManager.setLastUsed(chatId, projName);
+      console.log(`[PROJECT-SWITCH] Set lastUsed for chatId=${chatId} to projName=${projName} (alias)`);
     }
 
     // Get alias for display
@@ -448,4 +462,276 @@ async function handleProjectCallback(
   }
 
   await ctx.answerCallbackQuery({ text: "Unknown action" });
+}
+
+/**
+ * Handle AskUserQuestion callbacks: askuserq:{request_id}:{question_index}:{action}
+ * Action can be: option index (number), "done", "clear", or "other"
+ */
+async function handleAskUserQuestionCallback(
+  ctx: Context,
+  callbackData: string,
+  userId: number,
+  username: string
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    await ctx.answerCallbackQuery({ text: "Invalid chat" });
+    return;
+  }
+
+  // Parse callback: askuserq:{requestId}:{questionIndex}:{action}
+  const parts = callbackData.split(":");
+  if (parts.length !== 4) {
+    await ctx.answerCallbackQuery({ text: "Invalid callback format" });
+    return;
+  }
+
+  const requestId = parts[1]!;
+  const questionIndex = parseInt(parts[2]!, 10);
+  const action = parts[3]!;
+
+  // Find the pending question
+  const pending = sessionManager.getPendingQuestion(chatId);
+  if (!pending || pending.requestId !== requestId) {
+    await ctx.answerCallbackQuery({
+      text: "Question expired or invalid",
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Validate question index
+  if (questionIndex < 0 || questionIndex >= pending.questions.length) {
+    await ctx.answerCallbackQuery({ text: "Invalid question index" });
+    return;
+  }
+
+  const question = pending.questions[questionIndex]!;
+  const projectName = pending.projectName;
+  const projectAlias = getProjectAlias(
+    (await sessionManager.getOrCreateSession(projectName)).workingDir
+  );
+
+  // Handle "other" action - prompt for free text
+  if (action === "other") {
+    pending.awaitingFreeText = true;
+    await ctx.answerCallbackQuery({ text: "Type your response..." });
+
+    // Update the message to prompt for text input
+    try {
+      await ctx.editMessageText(
+        `<b>${escapeHtml(projectAlias)}</b> | <b>${escapeHtml(question.header)}</b>\n\n` +
+          `${escapeHtml(question.question)}\n\n` +
+          `<i>Please type your response below:</i>`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit message for free text prompt:", error);
+    }
+    return;
+  }
+
+  // Handle "clear" action - reset all selections
+  if (action === "clear") {
+    pending.selectedIndices.set(questionIndex, new Set());
+
+    // Re-render the keyboard
+    const messageText = formatQuestionMessage(
+      question,
+      projectAlias,
+      pending.selectedIndices.get(questionIndex)
+    );
+    const keyboard = createQuestionKeyboard(
+      question,
+      pending.selectedIndices.get(questionIndex)!,
+      requestId,
+      questionIndex
+    );
+
+    try {
+      await ctx.editMessageText(messageText, {
+        parse_mode: "HTML",
+        reply_markup: keyboard,
+      });
+    } catch (error) {
+      console.debug("Failed to update message after clear:", error);
+    }
+
+    await ctx.answerCallbackQuery({ text: "Selections cleared" });
+    return;
+  }
+
+  // Handle "done" action - submit multi-select selections
+  if (action === "done") {
+    const selections = pending.selectedIndices.get(questionIndex) || new Set();
+
+    if (selections.size === 0) {
+      await ctx.answerCallbackQuery({
+        text: "Please select at least one option",
+        show_alert: true,
+      });
+      return;
+    }
+
+    // Format selections for display and sending to Claude
+    const selectionText = formatSelectionsForClaude(question, selections);
+
+    // Update the message to show selection
+    try {
+      await ctx.editMessageText(
+        `\u2713 <b>${escapeHtml(question.header)}:</b> ${escapeHtml(selectionText)}`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit message after done:", error);
+    }
+
+    await ctx.answerCallbackQuery({ text: `Selected: ${selectionText.slice(0, 50)}` });
+
+    // Clear the pending question
+    sessionManager.clearPendingQuestion(projectName);
+
+    // Send the selection to Claude
+    await sendResponseToClaude(ctx, selectionText, projectName, username, userId, chatId);
+    return;
+  }
+
+  // Handle option selection (action is a number)
+  const optionIndex = parseInt(action, 10);
+  if (isNaN(optionIndex) || optionIndex < 0 || optionIndex >= question.options.length) {
+    await ctx.answerCallbackQuery({ text: "Invalid option" });
+    return;
+  }
+
+  const selectedOption = question.options[optionIndex]!;
+
+  if (question.multiSelect) {
+    // Multi-select: toggle the selection
+    const updatedSelections = sessionManager.updateQuestionSelection(
+      projectName,
+      questionIndex,
+      optionIndex
+    );
+
+    if (!updatedSelections) {
+      await ctx.answerCallbackQuery({ text: "Error updating selection" });
+      return;
+    }
+
+    // Re-render the keyboard with updated checkmarks
+    const messageText = formatQuestionMessage(
+      question,
+      projectAlias,
+      updatedSelections
+    );
+    const keyboard = createQuestionKeyboard(
+      question,
+      updatedSelections,
+      requestId,
+      questionIndex
+    );
+
+    try {
+      await ctx.editMessageText(messageText, {
+        parse_mode: "HTML",
+        reply_markup: keyboard,
+      });
+    } catch (error) {
+      console.debug("Failed to update message after toggle:", error);
+    }
+
+    const isSelected = updatedSelections.has(optionIndex);
+    await ctx.answerCallbackQuery({
+      text: isSelected
+        ? `\u2713 ${selectedOption.label}`
+        : `Deselected: ${selectedOption.label}`,
+    });
+  } else {
+    // Single-select: submit immediately
+    const selectionText = selectedOption.label;
+
+    // Update the message to show selection
+    try {
+      await ctx.editMessageText(
+        `\u2713 <b>${escapeHtml(question.header)}:</b> ${escapeHtml(selectionText)}`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit message after single-select:", error);
+    }
+
+    await ctx.answerCallbackQuery({ text: `Selected: ${selectionText.slice(0, 50)}` });
+
+    // Clear the pending question
+    sessionManager.clearPendingQuestion(projectName);
+
+    // Send the selection to Claude
+    await sendResponseToClaude(ctx, selectionText, projectName, username, userId, chatId);
+  }
+}
+
+/**
+ * Send the user's response to Claude.
+ */
+async function sendResponseToClaude(
+  ctx: Context,
+  message: string,
+  projectName: string,
+  username: string,
+  userId: number,
+  chatId: number
+): Promise<void> {
+  // Get the project session
+  const projectSession = await sessionManager.getOrCreateSession(projectName);
+  const projectAlias = getProjectAlias(projectSession.workingDir);
+
+  // Interrupt any running query - button responses are always immediate
+  if (projectSession.isRunning()) {
+    console.log("Interrupting current query for AskUserQuestion response");
+    await projectSession.session.stop();
+    // Small delay to ensure clean interruption
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  // Start typing
+  const typing = startTypingIndicator(ctx);
+
+  // Create streaming state
+  const state = new StreamingState();
+  const statusCallback = createStatusCallback(ctx, state, projectAlias);
+
+  try {
+    const response = await projectSession.sendMessage(
+      message,
+      username,
+      userId,
+      statusCallback,
+      chatId,
+      ctx
+    );
+
+    await auditLog(userId, username, "ASKUSERQ_CALLBACK", message, response);
+  } catch (error) {
+    console.error("Error processing AskUserQuestion callback:", error);
+
+    for (const toolMsg of state.toolMessages) {
+      try {
+        await ctx.api.deleteMessage(toolMsg.chat.id, toolMsg.message_id);
+      } catch (deleteError) {
+        console.debug("Failed to delete tool message:", deleteError);
+      }
+    }
+
+    if (String(error).includes("abort") || String(error).includes("cancel")) {
+      const wasInterrupt = projectSession.session.consumeInterruptFlag();
+      if (!wasInterrupt) {
+        await ctx.reply("\u{1F6D1} Query stopped.");
+      }
+    } else {
+      await ctx.reply(`\u274C Error: ${String(error).slice(0, 200)}`);
+    }
+  } finally {
+    typing.stop();
+  }
 }

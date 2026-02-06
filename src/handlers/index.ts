@@ -22,3 +22,11 @@ export { handlePhoto } from "./photo";
 export { handleDocument } from "./document";
 export { handleCallback } from "./callback";
 export { StreamingState, createStatusCallback } from "./streaming";
+export {
+  isAskUserQuestionInput,
+  displayAskUserQuestions,
+  formatQuestionMessage,
+  createQuestionKeyboard,
+  handleFreeTextQuestionResponse,
+  formatSelectionsForClaude,
+} from "./ask-user-question";

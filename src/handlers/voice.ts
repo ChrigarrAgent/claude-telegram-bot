@@ -10,7 +10,6 @@ import {
   auditLog,
   auditLogRateLimit,
   transcribeVoice,
-  startTypingIndicator,
 } from "../utils";
 import { getProjectAlias } from "../project-aliases";
 import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
@@ -57,9 +56,6 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
   // 5. Mark processing started (allows /stop to work during transcription/classification)
   const stopProcessing = projectSession.session.startProcessing();
-
-  // 6. Start typing indicator for transcription
-  const typing = startTypingIndicator(ctx);
 
   let voicePath: string | null = null;
 
@@ -126,7 +122,6 @@ export async function handleVoice(ctx: Context): Promise<void> {
     await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
-    typing.stop();
 
     // Clean up voice file
     if (voicePath) {
