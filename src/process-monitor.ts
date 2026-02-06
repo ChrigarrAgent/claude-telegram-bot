@@ -25,19 +25,23 @@ export interface LongRunStatus {
 }
 
 type CompletionCallback = (status: LongRunStatus) => Promise<void>;
+type StartCallback = (status: LongRunStatus) => Promise<void>;
 
 export class ProcessMonitor {
   private timer: ReturnType<typeof setInterval> | null = null;
   private handledIds = new Set<string>();
-  private callback: CompletionCallback | null = null;
+  private notifiedStartIds = new Set<string>();
+  private completionCallback: CompletionCallback | null = null;
+  private startCallback: StartCallback | null = null;
 
   /**
-   * Start monitoring for process completions.
+   * Start monitoring for process completions and new process starts.
    * On startup, already-completed processes are marked as handled
    * unless they completed within the last 5 minutes (handles bot-was-down case).
    */
-  start(callback: CompletionCallback): void {
-    this.callback = callback;
+  start(completionCallback: CompletionCallback, startCallback?: StartCallback): void {
+    this.completionCallback = completionCallback;
+    this.startCallback = startCallback || null;
     this.initialScan();
     this.timer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
     console.log("ProcessMonitor started");
@@ -85,6 +89,13 @@ export class ProcessMonitor {
       }
     }
 
+    // Mark already-running processes as start-notified (don't re-notify after restart)
+    for (const status of statuses) {
+      if (status.status === "running" || status.status === "starting") {
+        this.notifiedStartIds.add(status.id);
+      }
+    }
+
     this.cleanup(statuses);
 
     const running = statuses.filter(
@@ -102,21 +113,41 @@ export class ProcessMonitor {
   }
 
   /**
-   * Poll for status changes.
+   * Poll for status changes: new starts and completions.
    */
   private async poll(): Promise<void> {
     const statuses = this.readAllStatuses();
 
     for (const status of statuses) {
+      // Detect newly started processes
+      if (
+        (status.status === "running" || status.status === "starting") &&
+        !this.notifiedStartIds.has(status.id)
+      ) {
+        this.notifiedStartIds.add(status.id);
+
+        if (this.startCallback) {
+          try {
+            await this.startCallback(status);
+          } catch (error) {
+            console.error(
+              `ProcessMonitor start callback error for ${status.id}:`,
+              error
+            );
+          }
+        }
+      }
+
+      // Detect completed processes
       if (status.status === "completed" && !this.handledIds.has(status.id)) {
         this.handledIds.add(status.id);
 
-        if (this.callback) {
+        if (this.completionCallback) {
           try {
-            await this.callback(status);
+            await this.completionCallback(status);
           } catch (error) {
             console.error(
-              `ProcessMonitor callback error for ${status.id}:`,
+              `ProcessMonitor completion callback error for ${status.id}:`,
               error
             );
           }

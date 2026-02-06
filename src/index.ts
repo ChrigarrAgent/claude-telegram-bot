@@ -88,6 +88,65 @@ async function autoContinueSession(
 }
 
 /**
+ * Handle start of a long-running background process.
+ * Sends a simple notification to the user (no LLM action needed).
+ */
+async function handleProcessStart(status: LongRunStatus): Promise<void> {
+  try {
+    const { loadProjectAliases, getProjectAlias } = await import("./project-aliases");
+    const aliases = loadProjectAliases();
+
+    // Resolve CWD to project alias
+    let matchedAlias: string | null = null;
+    for (const [projectPath, alias] of Object.entries(aliases)) {
+      if (status.cwd === projectPath) {
+        matchedAlias = alias;
+        break;
+      }
+    }
+    if (!matchedAlias) {
+      for (const [projectPath, alias] of Object.entries(aliases)) {
+        if (status.cwd.startsWith(projectPath + "/")) {
+          matchedAlias = alias;
+          break;
+        }
+      }
+    }
+
+    if (!matchedAlias) return;
+
+    const chatIds = sessionManager.getChatIdsForProject(matchedAlias);
+    if (chatIds.length === 0) return;
+
+    const projectSession = sessionManager.getSession(matchedAlias);
+    const projectAlias = projectSession
+      ? getProjectAlias(projectSession.workingDir)
+      : matchedAlias;
+
+    // Clean up command for display (remove newlines from long-run format)
+    const command = status.command.replace(/\n/g, " ").trim();
+
+    for (const chatId of chatIds) {
+      try {
+        await bot.api.sendMessage(
+          chatId,
+          `<b>${projectAlias}:</b> ⏳ Long-running task started\n` +
+            `<code>${command}</code>\n\n` +
+            `You will be notified when it completes.`,
+          { parse_mode: "HTML" }
+        );
+      } catch (e) {
+        console.error(`ProcessMonitor: Failed to notify chat ${chatId} about start:`, e);
+      }
+    }
+
+    console.log(`ProcessMonitor: Notified start of ${status.id} for project ${matchedAlias}`);
+  } catch (error) {
+    console.error("ProcessMonitor: Failed to handle process start:", error);
+  }
+}
+
+/**
  * Handle completion of a long-running background process.
  * Resolves the process CWD to a project, notifies the user, and sends
  * a synthetic message to Claude to read the output log.
@@ -544,7 +603,7 @@ try {
   console.log("Polling started successfully (concurrent mode)");
 
   // Start monitoring for long-running process completions
-  processMonitor.start(handleProcessCompletion);
+  processMonitor.start(handleProcessCompletion, handleProcessStart);
 
   // Monitor runner task for unexpected termination
   runner.task()?.then(() => {
