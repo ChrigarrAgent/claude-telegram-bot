@@ -5,11 +5,12 @@
  */
 
 import { Bot } from "grammy";
-import { sequentialize } from "@grammyjs/runner";
+import { run, sequentialize } from "@grammyjs/runner";
 import { TELEGRAM_TOKEN, WORKING_DIR, ALLOWED_USERS, RESTART_FILE, ACTIVE_SESSIONS_FILE, HEARTBEAT_FILE } from "./config";
 import type { ActiveSessionsData, HeartbeatData, ActiveSessionEntry } from "./types";
 import { sessionManager } from "./session-manager";
 import { unlinkSync, readFileSync, existsSync } from "fs";
+import { acquireLock, releaseLock, setupLockCleanup } from "./process-lock";
 import {
   handleStart,
   handleNew,
@@ -163,8 +164,19 @@ bot.use(
     const chatId = ctx.chat?.id;
     if (!chatId) return undefined;
 
-    // Get last-used project for this chat (defaults to 'default' if none)
-    const projectName = sessionManager.getLastUsed(chatId) || 'default';
+    // Check for @project syntax in message to determine target project
+    // This allows concurrent multi-project messaging
+    const text = ctx.message?.text || "";
+    const atMatch = text.match(/^@(\S+)\s/);
+    let projectName: string;
+
+    if (atMatch) {
+      // Use the @-mentioned project for queue key
+      projectName = atMatch[1]!.toLowerCase();
+    } else {
+      // Fall back to last-used project
+      projectName = sessionManager.getLastUsed(chatId) || 'default';
+    }
 
     return `${chatId}:${projectName}`;
   })
@@ -209,27 +221,51 @@ bot.catch((err) => {
   console.error("Bot error:", err);
 });
 
-// Handle 409 polling conflicts gracefully (don't crash, just wait and retry)
+// Handle 409 polling conflicts by logging (actual retry logic is in startWithRetry)
+// We don't retry here anymore to avoid double-retry issues
 bot.api.config.use(async (prev, method, payload, signal) => {
   try {
     return await prev(method, payload, signal);
   } catch (error: any) {
-    // If it's a 409 conflict error, wait and let the runner retry
+    // If it's a 409 conflict error, log it but don't retry here
+    // The startWithRetry function handles the main retry logic
     if (error?.error_code === 409) {
-      console.warn("409 Conflict detected - another instance may be running. Waiting 35s...");
-      await new Promise(resolve => setTimeout(resolve, 35000));
-      // Retry once after waiting
-      return await prev(method, payload, signal);
+      console.warn(`409 Conflict in API call (${method}) - this will be handled by startWithRetry`);
     }
     throw error;
   }
 });
+
+// ============== Process Lock ==============
+
+// Setup cleanup handlers early (before any errors can occur)
+setupLockCleanup();
+
+// Acquire process lock to prevent multiple instances
+const lockResult = acquireLock();
+
+if (!lockResult.success) {
+  console.error("=".repeat(50));
+  console.error("STARTUP FAILED: " + lockResult.message);
+  console.error("=".repeat(50));
+  console.error("");
+  console.error("Another instance of the bot is already running.");
+  console.error("To force start, first stop the other instance:");
+  console.error("  pm2 stop claude-telegram-bot && pkill -9 -f 'bun.*claude-telegram-bot'");
+  console.error("");
+  process.exit(1);
+}
+
+if (lockResult.killedPids && lockResult.killedPids.length > 0) {
+  console.log(`Cleaned up ${lockResult.killedPids.length} stale process(es)`);
+}
 
 // ============== Startup ==============
 
 console.log("=".repeat(50));
 console.log("Claude Telegram Bot - TypeScript Edition");
 console.log("=".repeat(50));
+console.log(`PID: ${process.pid}`);
 console.log(`Working directory: ${WORKING_DIR}`);
 console.log(`Allowed users: ${ALLOWED_USERS.length}`);
 
@@ -377,34 +413,33 @@ if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
   }
 }
 
-// Start polling with retry logic for 409 conflicts
-async function startWithRetry(maxRetries = 3): Promise<void> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      await bot.start({
-        drop_pending_updates: true,
-        onStart: () => console.log("Polling started"),
-      });
-      return; // Success
-    } catch (error: any) {
-      if (error?.error_code === 409 && attempt < maxRetries) {
-        console.warn(`409 Conflict on attempt ${attempt}/${maxRetries}. Waiting 35s before retry...`);
-        await new Promise(resolve => setTimeout(resolve, 35000));
-        // Clear webhook again before retry
-        try {
-          await bot.api.deleteWebhook({ drop_pending_updates: true });
-        } catch {}
-      } else {
-        throw error;
-      }
-    }
-  }
-}
+// Start polling with concurrent update processing via @grammyjs/runner
+// This allows different projects to process messages in parallel,
+// while sequentialize ensures same-project messages are serial
+let runner: ReturnType<typeof run> | null = null;
 
-startWithRetry().catch(err => {
+try {
+  console.log("Starting concurrent polling with @grammyjs/runner...");
+  runner = run(bot, {
+    runner: {
+      // Retry getUpdates calls for up to 60 seconds on failure
+      maxRetryTime: 60000,
+      retryInterval: "exponential",
+    },
+  });
+  console.log("Polling started successfully (concurrent mode)");
+
+  // Monitor runner task for unexpected termination
+  runner.task()?.then(() => {
+    console.log("Runner stopped");
+  }).catch((err) => {
+    console.error("Runner crashed:", err);
+    process.exit(1);
+  });
+} catch (err) {
   console.error("Failed to start bot:", err);
   process.exit(1);
-});
+}
 
 // Heartbeat interval - writes state every 10 seconds for crash detection
 const HEARTBEAT_INTERVAL = 10_000;
@@ -443,9 +478,11 @@ const heartbeatTimer = setInterval(writeHeartbeat, HEARTBEAT_INTERVAL);
 writeHeartbeat(); // Write immediately on start
 
 // Graceful shutdown
-const stopBot = () => {
+const stopBot = async () => {
   console.log("Stopping bot...");
-  bot.stop();
+  if (runner?.isRunning()) {
+    await runner.stop();
+  }
 };
 
 /**
@@ -498,7 +535,10 @@ async function gracefulShutdown(signal: string): Promise<void> {
   // Save active sessions state
   await saveActiveSessionsState("signal");
 
-  stopBot();
+  // Release process lock
+  releaseLock();
+
+  await stopBot();
   process.exit(0);
 }
 

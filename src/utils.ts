@@ -218,35 +218,36 @@ export function startTypingIndicator(ctx: Context): TypingController {
 
 // ============== Message Interrupt ==============
 
-// Import session lazily to avoid circular dependency
-let sessionModule: {
-  session: {
+/**
+ * Check for ! prefix and interrupt the given project session's running query.
+ * Accepts the actual ClaudeSession to interrupt (not the legacy global singleton).
+ */
+export async function checkInterrupt(
+  text: string,
+  targetSession?: {
     isRunning: boolean;
     stop: () => Promise<"stopped" | "pending" | false>;
     markInterrupt: () => void;
     clearStopRequested: () => void;
-  };
-} | null = null;
-
-export async function checkInterrupt(text: string): Promise<string> {
+  }
+): Promise<string> {
   if (!text || !text.startsWith("!")) {
     return text;
   }
 
-  // Lazy import to avoid circular dependency
-  if (!sessionModule) {
-    sessionModule = await import("./session");
-  }
-
   const strippedText = text.slice(1).trimStart();
 
-  if (sessionModule.session.isRunning) {
-    console.log("! prefix - interrupting current query");
-    sessionModule.session.markInterrupt();
-    await sessionModule.session.stop();
-    await Bun.sleep(100);
+  if (targetSession && targetSession.isRunning) {
+    console.log("! prefix - interrupting current project query");
+    targetSession.markInterrupt();
+    await targetSession.stop();
+    // Wait for the abort to propagate and queryLock to release
+    for (let i = 0; i < 10; i++) {
+      await Bun.sleep(100);
+      if (!targetSession.isRunning) break;
+    }
     // Clear stopRequested so the new message can proceed
-    sessionModule.session.clearStopRequested();
+    targetSession.clearStopRequested();
   }
 
   return strippedText;

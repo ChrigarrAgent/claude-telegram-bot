@@ -17,6 +17,110 @@ import {
 } from "../config";
 
 /**
+ * Send a long message, splitting into multiple messages if needed.
+ * Handles Telegram's 4096 character limit gracefully.
+ */
+async function sendLongMessage(
+  ctx: Context,
+  text: string,
+  projectAlias: string
+): Promise<void> {
+  const htmlContent = convertMarkdownToHtml(text);
+  const prefix = `<b>${projectAlias}:</b> `;
+  const formatted = prefix + htmlContent;
+
+  // If it fits in one message, send it
+  if (formatted.length <= TELEGRAM_SAFE_LIMIT) {
+    try {
+      await ctx.reply(formatted, { parse_mode: "HTML" });
+      return;
+    } catch (htmlError: any) {
+      // If HTML fails (not length), try escaped
+      if (!htmlError?.description?.includes("too long")) {
+        console.warn("HTML reply failed, escaping:", htmlError?.description);
+        const escaped = escapeHtml(text);
+        const fallback = prefix + escaped;
+        if (fallback.length <= TELEGRAM_SAFE_LIMIT) {
+          await ctx.reply(fallback, { parse_mode: "HTML" });
+          return;
+        }
+      }
+      // Fall through to splitting
+    }
+  }
+
+  // Message is too long - split it
+  // Split by double newlines (paragraphs) first for cleaner breaks
+  const paragraphs = text.split(/\n\n+/);
+  const chunks: string[] = [];
+  let currentChunk = "";
+
+  for (const para of paragraphs) {
+    const testChunk = currentChunk ? currentChunk + "\n\n" + para : para;
+    // Leave room for prefix on first chunk and some buffer
+    const maxLen = chunks.length === 0 ? TELEGRAM_SAFE_LIMIT - prefix.length - 50 : TELEGRAM_SAFE_LIMIT - 50;
+
+    if (testChunk.length <= maxLen) {
+      currentChunk = testChunk;
+    } else {
+      // Current chunk is full, save it
+      if (currentChunk) {
+        chunks.push(currentChunk);
+      }
+      // If this paragraph itself is too long, split it by lines
+      if (para.length > maxLen) {
+        const lines = para.split("\n");
+        currentChunk = "";
+        for (const line of lines) {
+          const testLine = currentChunk ? currentChunk + "\n" + line : line;
+          if (testLine.length <= maxLen) {
+            currentChunk = testLine;
+          } else {
+            if (currentChunk) chunks.push(currentChunk);
+            // If single line is too long, hard split
+            if (line.length > maxLen) {
+              for (let i = 0; i < line.length; i += maxLen) {
+                chunks.push(line.slice(i, i + maxLen));
+              }
+              currentChunk = "";
+            } else {
+              currentChunk = line;
+            }
+          }
+        }
+      } else {
+        currentChunk = para;
+      }
+    }
+  }
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+
+  // Send each chunk
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]!;
+    const isFirst = i === 0;
+    const chunkPrefix = isFirst ? prefix : "";
+    const partIndicator = chunks.length > 1 ? ` <i>(${i + 1}/${chunks.length})</i>` : "";
+
+    try {
+      const htmlChunk = convertMarkdownToHtml(chunk);
+      await ctx.reply(chunkPrefix + htmlChunk + partIndicator, { parse_mode: "HTML" });
+    } catch (htmlError) {
+      // Fallback to escaped text
+      const escaped = escapeHtml(chunk);
+      await ctx.reply(chunkPrefix + escaped + partIndicator, { parse_mode: "HTML" });
+    }
+
+    // Small delay between chunks to maintain order
+    if (i < chunks.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+}
+
+/**
  * Create inline keyboard for ask_user options.
  */
 export function createAskUserKeyboard(
@@ -120,57 +224,43 @@ export function createStatusCallback(
       }
 
       if (statusType === "thinking") {
-        // Add thinking to working content
-        const preview = content.length > 400 ? content.slice(0, 400) + "..." : content;
+        // Show thinking preview (first ~300 chars) so user can see what Claude is working on
+        const preview = content.length > 300 ? content.slice(0, 300) + "..." : content;
         const escaped = escapeHtml(preview);
         state.workingContent.push(`🧠 <i>${escaped}</i>`);
-
-        // Update working message (throttled)
-        if (now - state.lastEditTime > STREAMING_THROTTLE_MS) {
-          await updateWorkingMessage(ctx, state, projectAlias);
-        }
+        // Update working message
+        await updateWorkingMessage(ctx, state, projectAlias);
       } else if (statusType === "tool") {
+        // Any previously accumulated text segments were intermediate reasoning
+        // (text before tool calls = Claude thinking out loud, not the final answer)
+        // Clear them so only text after the last tool call becomes the final message
+        if (state.finalTextSegments.length > 0) {
+          state.finalTextSegments = [];
+        }
+
         // Add tool to working content (already has HTML)
         state.workingContent.push(content);
 
-        // Update working message (throttled)
-        if (now - state.lastEditTime > STREAMING_THROTTLE_MS) {
-          await updateWorkingMessage(ctx, state, projectAlias);
-        }
+        // Force update on every tool event (important for visibility)
+        await updateWorkingMessage(ctx, state, projectAlias);
       } else if (statusType === "text" && segmentId !== undefined) {
-        // Intermediate text - add to working content with truncation
-        const preview = content.length > 300 ? content.slice(0, 300) + "..." : content;
-        const escaped = escapeHtml(preview);
-        state.workingContent.push(`📝 ${escaped}`);
-
-        // Update working message (throttled)
-        if (now - state.lastEditTime > STREAMING_THROTTLE_MS) {
-          await updateWorkingMessage(ctx, state, projectAlias);
-        }
+        // Intermediate text - skip adding to working message
+        // (it clutters the progress view and the final answer will show it)
       } else if (statusType === "segment_end" && segmentId !== undefined) {
         // Store final text segment for later
         if (content) {
           state.finalTextSegments.push(content);
         }
       } else if (statusType === "done") {
-        // Send final answer as separate clean message
-        if (state.finalTextSegments.length > 0) {
-          const finalText = state.finalTextSegments.join("\n\n");
-          const htmlContent = convertMarkdownToHtml(finalText);
-          const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
-
-          try {
-            await ctx.reply(formatted, { parse_mode: "HTML" });
-          } catch (htmlError) {
-            console.debug("HTML reply failed for final answer, escaping:", htmlError);
-            const escaped = escapeHtml(finalText);
-            await ctx.reply(`<b>${projectAlias}:</b> ${escaped}`, { parse_mode: "HTML" });
-          }
-        }
-
-        // Update working message one last time with "Complete" status
+        // First update working message with "Complete" status
         state.workingContent.push("✅ <b>Complete</b>");
         await updateWorkingMessage(ctx, state, projectAlias);
+
+        // Then send final answer as separate clean message(s)
+        if (state.finalTextSegments.length > 0) {
+          const finalText = state.finalTextSegments.join("\n\n");
+          await sendLongMessage(ctx, finalText, projectAlias);
+        }
       }
     } catch (error) {
       console.error("Status callback error:", error);
@@ -188,13 +278,33 @@ async function updateWorkingMessage(
 ): Promise<void> {
   if (!state.workingMessage) return;
 
-  const content = state.workingContent.join("\n\n");
-  const fullMessage = `🔄 <b>${projectAlias}:</b> Working...\n\n${content}`;
+  const content = state.workingContent.join("\n");
+  const fullMessage = `🔄 <b>${projectAlias}:</b>\n${content}`;
 
-  // Truncate if too long (Telegram limit)
-  const truncated = fullMessage.length > TELEGRAM_MESSAGE_LIMIT
-    ? fullMessage.slice(0, TELEGRAM_MESSAGE_LIMIT - 100) + "\n\n<i>... (truncated)</i>"
-    : fullMessage;
+  // Truncate if too long (Telegram limit) - keep recent items
+  let truncated = fullMessage;
+  if (fullMessage.length > TELEGRAM_MESSAGE_LIMIT) {
+    // Keep header and last items (most recent progress)
+    const header = `🔄 <b>${projectAlias}:</b>\n<i>... earlier progress truncated ...</i>\n`;
+    const availableSpace = TELEGRAM_MESSAGE_LIMIT - header.length - 50;
+
+    // Take last N items that fit
+    const items = state.workingContent.slice();
+    let kept: string[] = [];
+    let totalLen = 0;
+
+    for (let i = items.length - 1; i >= 0 && totalLen < availableSpace; i--) {
+      const item = items[i]!;
+      if (totalLen + item.length + 1 <= availableSpace) {
+        kept.unshift(item);
+        totalLen += item.length + 1;
+      } else {
+        break;
+      }
+    }
+
+    truncated = header + kept.join("\n");
+  }
 
   try {
     await ctx.api.editMessageText(
@@ -204,8 +314,11 @@ async function updateWorkingMessage(
       { parse_mode: "HTML" }
     );
     state.lastEditTime = Date.now();
-  } catch (error) {
-    console.debug("Failed to update working message:", error);
+  } catch (error: any) {
+    // Don't log "message is not modified" errors - that's expected
+    if (!error?.description?.includes("message is not modified")) {
+      console.warn("Failed to update working message:", error?.description || error);
+    }
   }
 }
 

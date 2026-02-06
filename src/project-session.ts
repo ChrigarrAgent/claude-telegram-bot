@@ -40,33 +40,21 @@ export class ProjectSession {
 
     this.queryLock = true;
     try {
-      // CRITICAL: Ensure Claude runs in this project's working directory
-      // This handles the case where we resume a session from a different project
-      const { setWorkingDir, getWorkingDir } = await import("./config");
-      const previousWorkingDir = getWorkingDir();
+      console.log(`[PROJECT-SESSION] Project: ${this.projectName}, workingDir: ${this.workingDir}`);
 
-      // Switch to this project's directory before sending message
-      if (previousWorkingDir !== this.workingDir) {
-        setWorkingDir(this.workingDir);
-      }
-
-      try {
-        const result = await this.session.sendMessageStreaming(
-          message,
-          username,
-          userId,
-          statusCallback,
-          chatId,
-          ctx
-        );
-        this.lastActivity = new Date();
-        return result;
-      } finally {
-        // Restore previous working directory if we changed it
-        if (previousWorkingDir !== this.workingDir) {
-          setWorkingDir(previousWorkingDir);
-        }
-      }
+      // Pass workingDir directly to avoid global state race conditions
+      // between concurrent project sessions
+      const result = await this.session.sendMessageStreaming(
+        message,
+        username,
+        userId,
+        statusCallback,
+        chatId,
+        ctx,
+        this.workingDir
+      );
+      this.lastActivity = new Date();
+      return result;
     } finally {
       this.queryLock = false;
     }

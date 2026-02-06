@@ -29,11 +29,18 @@ import {
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
 import {
+  isAskUserQuestionInput,
+  displayAskUserQuestions,
+} from "./handlers/ask-user-question";
+import {
   requestSafetyConfirmation,
   waitForSafetyDecision,
 } from "./handlers/safety-confirmation";
 import { checkCommandSafety, isPathAllowed } from "./security";
+import { getProjectAlias } from "./project-aliases";
+import { sessionManager } from "./session-manager";
 import type {
+  AskUserQuestionInput,
   SavedSession,
   SessionHistory,
   StatusCallback,
@@ -103,6 +110,9 @@ export class ClaudeSession {
   private _isProcessing = false;
   private _wasInterruptedByNewMessage = false;
   private _resumeAttempted = false; // Track if we tried to resume from disk
+  private typingInterval: Timer | null = null; // Typing indicator control
+  private currentCtx: Context | null = null; // Current context for typing
+  private typingIntervalId = 0; // Unique ID for each typing interval
 
   get isActive(): boolean {
     return this.sessionId !== null;
@@ -156,6 +166,9 @@ export class ClaudeSession {
    * Returns: "stopped" if query was aborted, "pending" if processing will be cancelled, false if nothing running
    */
   async stop(): Promise<"stopped" | "pending" | false> {
+    // Always stop typing indicator when stopping
+    this.stopTyping();
+
     // If a query is actively running, abort it
     if (this.isQueryRunning && this.abortController) {
       this.stopRequested = true;
@@ -185,12 +198,16 @@ export class ClaudeSession {
     userId: number,
     statusCallback: StatusCallback,
     chatId?: number,
-    ctx?: Context
+    ctx?: Context,
+    workingDir?: string
   ): Promise<string> {
     // Set chat context for ask_user MCP tool
     if (chatId) {
       process.env.TELEGRAM_CHAT_ID = String(chatId);
     }
+
+    // Store context for typing indicator
+    this.currentCtx = ctx || null;
 
     const isNewSession = !this.isActive;
     const thinkingTokens = getThinkingLevel(message);
@@ -223,7 +240,7 @@ export class ClaudeSession {
     // Build SDK V1 options - supports all features
     const options: Options = {
       model: "claude-sonnet-4-5",
-      cwd: getWorkingDir(),
+      cwd: workingDir || getWorkingDir(),
       settingSources: ["user", "project"],
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -254,6 +271,9 @@ export class ClaudeSession {
       this.sessionId = null;
     }
 
+    // DEBUG: Log the working directory being passed to Claude
+    console.log(`[SESSION] cwd being passed to SDK: ${options.cwd}`);
+
     // Check if stop was requested during processing phase
     if (this.stopRequested) {
       console.log(
@@ -269,6 +289,9 @@ export class ClaudeSession {
     this.stopRequested = false;
     this.queryStarted = new Date();
     this.currentTool = null;
+
+    // Start typing indicator now that query is actually running
+    this.startTyping();
 
     // Response tracking
     const responseParts: string[] = [];
@@ -345,7 +368,7 @@ export class ClaudeSession {
           this.sessionId = event.session_id;
           this._resumeAttempted = false; // Session validated successfully
           console.log(`GOT session_id: ${this.sessionId!.slice(0, 8)}...`);
-          this.saveSession();
+          this.saveSession(workingDir);
         } else if (this.sessionId && this._resumeAttempted) {
           // Resume was successful - got events with existing session_id
           this._resumeAttempted = false;
@@ -450,14 +473,36 @@ export class ClaudeSession {
                 currentSegmentText = "";
               }
 
+              // Check for AskUserQuestion format (used by GSD and similar plugins)
+              // This works regardless of tool name - we detect by input structure
+              if (isAskUserQuestionInput(toolInput) && ctx && chatId) {
+                const effectiveCwd = workingDir || getWorkingDir();
+                const projectName = effectiveCwd.split("/").pop() || "default";
+                const projectAlias = getProjectAlias(effectiveCwd);
+
+                const displayed = await displayAskUserQuestions(
+                  ctx,
+                  toolInput as AskUserQuestionInput,
+                  projectName,
+                  projectAlias,
+                  chatId
+                );
+
+                if (displayed) {
+                  askUserTriggered = true;
+                  // Don't show tool status for AskUserQuestion - buttons are displayed
+                  console.log(`AskUserQuestion displayed for ${projectName}`);
+                }
+              }
+
               // Format and show tool status
               const toolDisplay = formatToolStatus(toolName, toolInput);
               this.currentTool = toolDisplay;
               this.lastTool = toolDisplay;
               console.log(`Tool: ${toolDisplay}`);
 
-              // Don't show tool status for ask_user - the buttons are self-explanatory
-              if (!toolName.startsWith("mcp__ask-user")) {
+              // Don't show tool status for ask_user or AskUserQuestion - the buttons are self-explanatory
+              if (!toolName.startsWith("mcp__ask-user") && !askUserTriggered) {
                 await statusCallback("tool", toolDisplay);
               }
 
@@ -566,11 +611,13 @@ export class ClaudeSession {
         throw error;
       }
     } finally {
+      this.stopTyping(); // Always stop typing when query ends
       clearActivityTimeout();
       this.isQueryRunning = false;
       this.abortController = null;
       this.queryStarted = null;
       this.currentTool = null;
+      this.currentCtx = null; // Clear context reference
     }
 
     this.lastActivity = new Date();
@@ -594,12 +641,59 @@ export class ClaudeSession {
   }
 
   /**
+   * Start typing indicator.
+   */
+  private startTyping(): void {
+    // Stop any existing typing first
+    this.stopTyping();
+
+    if (this.currentCtx && !this.typingInterval) {
+      // Generate unique ID for this interval
+      const intervalId = ++this.typingIntervalId;
+      console.log(`[TYPING] Starting typing indicator #${intervalId} (session: ${this.sessionId?.slice(0, 8)})`);
+
+      this.typingInterval = setInterval(async () => {
+        // Check if this is still the active interval (prevents stale callbacks)
+        if (intervalId !== this.typingIntervalId || !this.currentCtx) {
+          console.log(`[TYPING] Interval #${intervalId} fired but is stale (current: ${this.typingIntervalId}), skipping`);
+          return;
+        }
+        console.log(`[TYPING] Sending typing action (interval #${intervalId})`);
+        try {
+          await this.currentCtx.replyWithChatAction("typing");
+        } catch (error) {
+          console.debug("Typing indicator failed:", error);
+        }
+      }, 4000);
+      // Send immediately
+      console.log(`[TYPING] Sending typing action (immediate #${intervalId})`);
+      this.currentCtx.replyWithChatAction("typing").catch(() => {});
+    }
+  }
+
+  /**
+   * Stop typing indicator.
+   */
+  private stopTyping(): void {
+    console.log(`[TYPING] Stopping typing indicator #${this.typingIntervalId} (session: ${this.sessionId?.slice(0, 8)}, isQueryRunning: ${this.isQueryRunning})`);
+    // Increment ID to invalidate any queued callbacks from old interval
+    this.typingIntervalId++;
+    if (this.typingInterval) {
+      console.log(`[TYPING] Clearing interval, new ID: ${this.typingIntervalId}`);
+      clearInterval(this.typingInterval);
+      this.typingInterval = null;
+    }
+  }
+
+  /**
    * Kill the current session (clear session_id).
    */
   async kill(): Promise<void> {
+    this.stopTyping(); // Ensure typing is stopped
     this.sessionId = null;
     this.lastActivity = null;
     this.conversationTitle = null;
+    this.currentCtx = null;
     console.log("Session cleared");
   }
 
@@ -633,7 +727,7 @@ export class ClaudeSession {
    * Save session to disk for resume after restart.
    * Saves to multi-session history format.
    */
-  saveSession(): void {
+  saveSession(overrideWorkingDir?: string): void {
     if (!this.sessionId) return;
 
     try {
@@ -641,7 +735,7 @@ export class ClaudeSession {
       const history = this.loadSessionHistory();
 
       // Create new session entry with project name
-      const workDir = getWorkingDir();
+      const workDir = overrideWorkingDir || getWorkingDir();
       const projectName = workDir.split("/").pop() || DEFAULT_PROJECT_NAME;
       const newSession: SavedSession = {
         session_id: this.sessionId,

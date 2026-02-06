@@ -15,6 +15,7 @@ import {
 } from "../utils";
 import { getProjectAlias, getProjectByAlias } from "../project-aliases";
 import { getProjectNameForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
+import { handleFreeTextQuestionResponse } from "./ask-user-question";
 
 const execAsync = promisify(exec);
 
@@ -176,6 +177,9 @@ export async function handleText(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id;
   let message = ctx.message?.text;
 
+  // Debug: log every incoming text message
+  console.log(`[TEXT] Received: "${message?.slice(0, 50)}..." from ${username} (chat ${chatId})`);
+
   if (!userId || !message || !chatId) {
     return;
   }
@@ -202,16 +206,19 @@ export async function handleText(ctx: Context): Promise<void> {
 
     // Check if this alias exists
     const projectPath = getProjectByAlias(projectAlias!);
+    console.log(`[@PROJECT] Parsed alias: "${projectAlias}", resolved path: ${projectPath}`);
     if (projectPath) {
-      targetProjectFromAtSyntax = projectAlias!.toLowerCase();
+      // IMPORTANT: Use the ALIAS for session tracking, not the folder name!
+      // This ensures consistency - the alias is what resolveProjectPath() can look up.
+      const projName = projectAlias!.toLowerCase();
+      targetProjectFromAtSyntax = projName;
       message = remainingMessage!;
 
       // Switch to this project
       setWorkingDir(projectPath);
-      const pathParts = projectPath.split("/");
-      const projName = pathParts[pathParts.length - 1] || "default";
       sessionManager.setCurrentProject(projName);
       sessionManager.setLastUsed(chatId, projName);
+      console.log(`[@PROJECT] Set working dir to: ${projectPath}, projName: ${projName} (alias)`);
     } else {
       // Unknown project alias - warn user and continue with original message
       await ctx.reply(
@@ -241,8 +248,18 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
+  // 1.7. Handle pending AskUserQuestion free text response
+  const pendingQuestion = sessionManager.getPendingQuestion(chatId, projectName);
+  if (pendingQuestion?.awaitingFreeText) {
+    // Handle the free text response (updates UI)
+    await handleFreeTextQuestionResponse(ctx, message, pendingQuestion);
+    // Continue to send the text to Claude (don't return early)
+    // The message will be sent as normal below
+  }
+
   // 2. Check for interrupt prefix (per-project)
-  message = await checkInterrupt(message);
+  // Pass the actual project session so ! targets the right running query
+  message = await checkInterrupt(message, projectSession.session);
   if (!message.trim()) {
     return;
   }
