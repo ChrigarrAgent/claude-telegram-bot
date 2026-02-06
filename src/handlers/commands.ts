@@ -269,30 +269,43 @@ export async function handleResume(ctx: Context): Promise<void> {
     sessionsByProject.delete(currentProject);
   }
 
+  // Collect active session IDs per project for marking current sessions
+  const activeSessionIds = new Set<string>();
+  for (const projSess of sessionManager.getAllSessions()) {
+    if (projSess.session.sessionId) {
+      activeSessionIds.add(projSess.session.sessionId);
+    }
+  }
+
+  // Helper to build a session button
+  const makeButton = (s: typeof allSessions[0], prefix: string) => {
+    const date = new Date(s.saved_at);
+    const dateStr = date.toLocaleDateString("it-IT", {
+      day: "2-digit",
+      month: "2-digit",
+    });
+    const timeStr = date.toLocaleTimeString("it-IT", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    const titlePreview =
+      s.title.length > 25 ? s.title.slice(0, 22) + "..." : s.title;
+    const isActive = activeSessionIds.has(s.session_id);
+    const activeMarker = isActive ? "\u2713 " : "";
+
+    return [{
+      text: `${activeMarker}${prefix}${dateStr} ${timeStr} - "${titlePreview}"`,
+      callback_data: `resume:${s.session_id}:${s.project || "default"}`,
+    }];
+  };
+
   // Build inline keyboard with session list
   const buttons: { text: string; callback_data: string }[][] = [];
 
   if (currentSessions) {
     for (const s of currentSessions) {
-      const date = new Date(s.saved_at);
-      const dateStr = date.toLocaleDateString("it-IT", {
-        day: "2-digit",
-        month: "2-digit",
-      });
-      const timeStr = date.toLocaleTimeString("it-IT", {
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-
-      const titlePreview =
-        s.title.length > 30 ? s.title.slice(0, 27) + "..." : s.title;
-
-      buttons.push([
-        {
-          text: `📅 ${dateStr} ${timeStr} - "${titlePreview}"`,
-          callback_data: `resume:${s.session_id}:${s.project || "default"}`,
-        },
-      ]);
+      buttons.push(makeButton(s, ""));
     }
   }
 
@@ -301,25 +314,7 @@ export async function handleResume(ctx: Context): Promise<void> {
     lines.push(`\n📁 <b>${projName}</b>`);
 
     for (const s of sessions) {
-      const date = new Date(s.saved_at);
-      const dateStr = date.toLocaleDateString("it-IT", {
-        day: "2-digit",
-        month: "2-digit",
-      });
-      const timeStr = date.toLocaleTimeString("it-IT", {
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-
-      const titlePreview =
-        s.title.length > 30 ? s.title.slice(0, 27) + "..." : s.title;
-
-      buttons.push([
-        {
-          text: `${projName}: ${dateStr} ${timeStr} - "${titlePreview}"`,
-          callback_data: `resume:${s.session_id}:${s.project || "default"}`,
-        },
-      ]);
+      buttons.push(makeButton(s, `${projName}: `));
     }
   }
 

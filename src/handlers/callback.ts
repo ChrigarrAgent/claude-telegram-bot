@@ -249,10 +249,15 @@ async function handleResumeCallback(
   // Get or create project session
   const projectSession = await sessionManager.getOrCreateSession(projectName);
 
-  // Check if session is already active
-  if (projectSession.isActive()) {
-    await ctx.answerCallbackQuery({ text: "Session already active for this project" });
+  // If this exact session is already active, no need to switch
+  if (projectSession.session.sessionId === sessionId) {
+    await ctx.answerCallbackQuery({ text: "This session is already active" });
     return;
+  }
+
+  // If a different session is active, save it before switching
+  if (projectSession.isActive()) {
+    projectSession.session.saveSession();
   }
 
   // ALWAYS switch to the project's working directory when resuming
