@@ -33,8 +33,7 @@ export type ProcessGroupCallback = (
   items: string[],
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ) => Promise<void>;
 
 /**
@@ -60,6 +59,7 @@ export function createMediaGroupBuffer(config: MediaGroupConfig) {
     const userId = group.ctx.from?.id;
     const username = group.ctx.from?.username || "unknown";
     const chatId = group.ctx.chat?.id;
+    const chatType = group.ctx.chat?.type;
 
     if (!userId || !chatId) return;
 
@@ -85,8 +85,7 @@ export function createMediaGroupBuffer(config: MediaGroupConfig) {
       group.items,
       group.caption,
       userId,
-      username,
-      chatId
+      username
     );
 
     // Delete status message

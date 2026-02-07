@@ -9,7 +9,7 @@ import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit } from "../utils";
 import { createMediaGroupBuffer } from "./media-group";
-import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
+import { getSessionOrReply, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 // Create photo-specific media group buffer
 const photoBuffer = createMediaGroupBuffer({
@@ -52,10 +52,14 @@ async function processPhotos(
   photoPaths: string[],
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
-  const projectSession = await getSessionForChat(chatId);
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const chatId = ctx.chat?.id!;
+
   const stopProcessing = projectSession.session.startProcessing();
 
   // Build prompt
@@ -111,6 +115,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
   const mediaGroupId = ctx.message?.media_group_id;
 
   if (!userId || !chatId) {
@@ -171,8 +176,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
       [photoPath],
       ctx.message?.caption,
       userId,
-      username,
-      chatId
+      username
     );
 
     // Clean up status message

@@ -972,3 +972,158 @@ export async function handleVoice(ctx: Context): Promise<void> {
     );
   }
 }
+
+/**
+ * /link <project-name> - Link a group chat to a project (requires verification).
+ */
+export async function handleLink(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
+  const groupTitle = ctx.chat?.title || "Unknown Group";
+
+  if (!userId || !chatId) {
+    return;
+  }
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    return;
+  }
+
+  // Only works in groups
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (!isGroup) {
+    await ctx.reply(
+      "⚠️ The <code>/link</code> command only works in group chats.\n\n" +
+      "Use it in a group to link the group to a project.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Parse project name from command
+  const args = ctx.message?.text?.split(/\s+/).slice(1);
+  if (!args || args.length === 0) {
+    await ctx.reply(
+      "❌ Please specify a project name.\n\n" +
+      "Usage: <code>/link &lt;project-name&gt;</code>\n\n" +
+      "Example: <code>/link exmas-commuter</code>",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const projectAlias = args[0]!.toLowerCase();
+  const projectPath = getProjectByAlias(projectAlias);
+
+  if (!projectPath) {
+    await ctx.reply(
+      `❌ Unknown project: <code>${projectAlias}</code>\n\n` +
+      "Use <code>/projects</code> to see available projects.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Check if already linked
+  const { getGroupLink } = await import("../group-links");
+  const existingLink = getGroupLink(chatId);
+  if (existingLink) {
+    await ctx.reply(
+      `⚠️ This group is already linked to <code>${existingLink.projectName}</code>.\n\n` +
+      "Use <code>/unlink</code> first to unlink, then link to a different project.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Generate verification code (6-digit)
+  const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // Store pending link
+  sessionManager.setPendingGroupLink({
+    groupId: chatId,
+    groupTitle,
+    projectName: projectAlias,
+    projectPath,
+    verificationCode,
+    createdAt: new Date(),
+    requestedBy: userId,
+  });
+
+  // Send verification code to user's DM
+  try {
+    await ctx.api.sendMessage(
+      userId,
+      `🔐 Group Link Verification\n\n` +
+      `You requested to link group <b>${groupTitle}</b> to project <code>${projectAlias}</code>.\n\n` +
+      `Verification code: <code>${verificationCode}</code>\n\n` +
+      `Go back to the group and send this code to complete the link.\n\n` +
+      `<i>Code expires in 10 minutes.</i>`,
+      { parse_mode: "HTML" }
+    );
+
+    await ctx.reply(
+      `📬 Verification code sent to your DM.\n\n` +
+      `Check your private chat with the bot and paste the code here to complete the link.`,
+      { parse_mode: "HTML" }
+    );
+  } catch (error) {
+    console.error("Failed to send verification code:", error);
+    sessionManager.clearPendingGroupLink(chatId);
+    await ctx.reply(
+      `❌ Failed to send verification code to your DM.\n\n` +
+      `Make sure you've started a private chat with the bot first (send /start in DM).`
+    );
+  }
+}
+
+/**
+ * /unlink - Unlink a group chat from its project.
+ */
+export async function handleUnlink(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
+
+  if (!userId || !chatId) {
+    return;
+  }
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    return;
+  }
+
+  // Only works in groups
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (!isGroup) {
+    await ctx.reply(
+      "⚠️ The <code>/unlink</code> command only works in group chats.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Check if linked
+  const { getGroupLink, removeGroupLink } = await import("../group-links");
+  const link = getGroupLink(chatId);
+
+  if (!link) {
+    await ctx.reply(
+      "⚠️ This group is not linked to any project.\n\n" +
+      "Use <code>/link &lt;project-name&gt;</code> to link it.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Remove link
+  removeGroupLink(chatId);
+
+  await ctx.reply(
+    `✅ Group unlinked from project <code>${link.projectName}</code>.`,
+    { parse_mode: "HTML" }
+  );
+}

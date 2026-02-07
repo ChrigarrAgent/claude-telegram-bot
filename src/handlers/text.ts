@@ -175,6 +175,7 @@ export async function handleText(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
   let message = ctx.message?.text;
 
   // Debug: log every incoming text message
@@ -194,6 +195,62 @@ export async function handleText(ctx: Context): Promise<void> {
   if (!isAuthorized(userId, ALLOWED_USERS)) {
     await ctx.reply("Unauthorized. Contact the bot owner for access.");
     return;
+  }
+
+  // 1.2. Check for group link verification code (groups only)
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (isGroup) {
+    // Check if this is a verification code (6 digits)
+    const codeMatch = message.match(/^\s*(\d{6})\s*$/);
+    if (codeMatch) {
+      const code = codeMatch[1]!;
+      const pendingLink = sessionManager.getPendingGroupLink(chatId);
+
+      if (pendingLink && pendingLink.verificationCode === code) {
+        // Valid code - complete the link
+        const { setGroupLink } = await import("../group-links");
+        setGroupLink(chatId, {
+          projectName: pendingLink.projectName,
+          projectPath: pendingLink.projectPath,
+          linkedAt: new Date().toISOString(),
+          linkedBy: userId,
+          groupTitle: pendingLink.groupTitle,
+        });
+
+        // Clear pending link
+        sessionManager.clearPendingGroupLink(chatId);
+
+        // Set this group as the last-used project for this chat
+        sessionManager.setLastUsed(chatId, pendingLink.projectName);
+
+        await ctx.reply(
+          `✅ Group successfully linked to project <code>${pendingLink.projectName}</code>!\n\n` +
+          `You can now send messages and files to Claude in this group.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else if (pendingLink) {
+        // Invalid code
+        await ctx.reply(
+          `❌ Invalid verification code.\n\n` +
+          `The code sent to your DM is different. Please check and try again.\n\n` +
+          `<i>Use /link again if the code expired.</i>`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else {
+        // No pending link for this group
+        await ctx.reply(
+          `⚠️ No pending link verification for this group.\n\n` +
+          `Use <code>/link &lt;project-name&gt;</code> to start the linking process.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+    }
+
+    // Clean up expired pending links periodically
+    sessionManager.cleanupExpiredGroupLinks();
   }
 
   // 1.4. Parse @project syntax for direct project routing
@@ -231,7 +288,17 @@ export async function handleText(ctx: Context): Promise<void> {
   }
 
   // 1.5. Determine target project (from @-syntax, last-used, or default)
-  const projectName = targetProjectFromAtSyntax || getProjectNameForChat(chatId);
+  const projectName = targetProjectFromAtSyntax || getProjectNameForChat(chatId, chatType);
+
+  // Check if group is unlinked
+  if (!projectName) {
+    await ctx.reply(
+      "⚠️ This group is not linked to any project.\n\n" +
+      "Use <code>/link &lt;project-name&gt;</code> to link it.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
 
   // Get or create project session
   const projectSession = await sessionManager.getOrCreateSession(projectName);

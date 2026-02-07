@@ -11,7 +11,7 @@ import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit } from "../utils";
 import { createMediaGroupBuffer } from "./media-group";
-import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
+import { getSessionOrReply, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 // Supported text file extensions
 const TEXT_EXTENSIONS = [
@@ -227,10 +227,13 @@ async function processArchive(
   fileName: string,
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
-  const projectSession = await getSessionForChat(chatId);
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const chatId = ctx.chat?.id!;
   const stopProcessing = projectSession.session.startProcessing();
 
   // Show extraction progress
@@ -338,10 +341,13 @@ async function processDocuments(
   documents: Array<{ path: string; name: string; content: string }>,
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
-  const projectSession = await getSessionForChat(chatId);
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const chatId = ctx.chat?.id!;
   const stopProcessing = projectSession.session.startProcessing();
 
   // Build prompt
@@ -409,8 +415,7 @@ async function processDocumentPaths(
   paths: string[],
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
   // Extract text from all documents
   const documents: Array<{ path: string; name: string; content: string }> = [];
@@ -430,7 +435,7 @@ async function processDocumentPaths(
     return;
   }
 
-  await processDocuments(ctx, documents, caption, userId, username, chatId);
+  await processDocuments(ctx, documents, caption, userId, username);
 }
 
 /**
@@ -440,6 +445,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
   const doc = ctx.message?.document;
   const mediaGroupId = ctx.message?.media_group_id;
 
@@ -505,8 +511,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
       fileName,
       ctx.message?.caption,
       userId,
-      username,
-      chatId
+      username
     );
     return;
   }
@@ -531,8 +536,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
         [{ path: docPath, name: fileName, content }],
         ctx.message?.caption,
         userId,
-        username,
-        chatId
+        username
       );
     } catch (error) {
       console.error("Failed to extract document:", error);

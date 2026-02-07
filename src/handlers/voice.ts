@@ -12,7 +12,7 @@ import {
   transcribeVoice,
 } from "../utils";
 import { getProjectAlias } from "../project-aliases";
-import { getSessionForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
+import { getSessionOrReply, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 /**
  * Handle incoming voice messages.
@@ -51,8 +51,9 @@ export async function handleVoice(ctx: Context): Promise<void> {
     return;
   }
 
-  // 4. Get project session for this chat
-  const projectSession = await getSessionForChat(chatId);
+  // 4. Get project session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
 
   // 5. Mark processing started (allows /stop to work during transcription/classification)
   const stopProcessing = projectSession.session.startProcessing();

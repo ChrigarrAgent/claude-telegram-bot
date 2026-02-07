@@ -12,11 +12,26 @@ import { StreamingState, createStatusCallback } from "./handlers/streaming";
 import { getProjectAlias } from "./project-aliases";
 
 /**
- * Get the project name for a chat, using last-used or deriving from working directory.
+ * Get the project name for a chat (DM or group).
+ *
+ * For groups: Returns linked project or null if not linked.
+ * For DMs: Returns last-used project or "default".
  */
-export function getProjectNameForChat(chatId: number): string {
+export function getProjectNameForChat(chatId: number, chatType?: string): string | null {
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+
+  if (isGroup) {
+    // Groups: lookup permanent link
+    const { getGroupLink } = require("./group-links");
+    const link = getGroupLink(chatId);
+    const projectName = link ? link.projectName : null;
+    console.log(`[getProjectNameForChat] GROUP chatId=${chatId}, linked=${projectName}`);
+    return projectName;
+  }
+
+  // DMs: use last-used project
   const lastUsed = sessionManager.getLastUsed(chatId);
-  console.log(`[getProjectNameForChat] chatId=${chatId}, lastUsed=${lastUsed}`);
+  console.log(`[getProjectNameForChat] DM chatId=${chatId}, lastUsed=${lastUsed}`);
   if (lastUsed) return lastUsed;
 
   const pathParts = getWorkingDir().split("/");
@@ -27,11 +42,52 @@ export function getProjectNameForChat(chatId: number): string {
 
 /**
  * Get or create a project session for a chat, tracking last-used.
+ * Returns null if chat is a group that's not linked to any project.
  */
-export async function getSessionForChat(chatId: number): Promise<ProjectSession> {
-  const projectName = getProjectNameForChat(chatId);
+export async function getSessionForChat(chatId: number, chatType?: string): Promise<ProjectSession | null> {
+  const projectName = getProjectNameForChat(chatId, chatType);
+
+  // If group is not linked, return null
+  if (!projectName) {
+    return null;
+  }
+
   const projectSession = await sessionManager.getOrCreateSession(projectName);
   sessionManager.setLastUsed(chatId, projectName);
+  return projectSession;
+}
+
+/**
+ * Get session for chat, or send error reply if group is unlinked.
+ * Returns session or null (if null was returned, error was already sent to user).
+ *
+ * This consolidates the common pattern:
+ * - Extract chatType
+ * - Get session
+ * - Handle null with helpful error message
+ *
+ * @example
+ * const session = await getSessionOrReply(ctx);
+ * if (!session) return; // Error already sent to user
+ * // ... use session
+ */
+export async function getSessionOrReply(ctx: Context): Promise<ProjectSession | null> {
+  const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
+
+  if (!chatId) return null;
+
+  const projectSession = await getSessionForChat(chatId, chatType);
+
+  if (!projectSession) {
+    await ctx.reply(
+      "⚠️ This group is not linked to any project.\n\n" +
+      "Use <code>/link &lt;project-name&gt;</code> to link it.",
+      { parse_mode: "HTML" }
+    );
+    return null;
+  }
+
   return projectSession;
 }
 
@@ -136,4 +192,11 @@ export async function handleMessageError(
   // Generic error - show truncated message
   await ctx.reply(`❌ Error: ${errorStr.slice(0, 200)}`);
   return true;
+}
+
+/**
+ * Check if chat is a Telegram group.
+ */
+export function isGroupChat(chatType?: string): boolean {
+  return chatType === 'group' || chatType === 'supergroup';
 }

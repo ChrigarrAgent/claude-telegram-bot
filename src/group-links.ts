@@ -97,3 +97,12 @@ export function getAllGroupLinks(): Map<number, GroupLink> {
   loadGroupLinks();
   return new Map(groupLinksCache);
 }
+
+/**
+ * Clear all group links (for testing).
+ */
+export function clearAllGroupLinks(): void {
+  groupLinksCache = new Map();
+  cacheLoaded = true;
+  saveGroupLinks();
+}

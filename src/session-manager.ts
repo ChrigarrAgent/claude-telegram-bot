@@ -30,6 +30,19 @@ export interface PendingClone {
 }
 
 /**
+ * Pending group link verification state.
+ */
+export interface PendingGroupLink {
+  groupId: number;
+  groupTitle: string;
+  projectName: string;
+  projectPath: string;
+  verificationCode: string;
+  createdAt: Date;
+  requestedBy: number;
+}
+
+/**
  * SessionManager coordinates multiple ProjectSession instances.
  */
 class SessionManager {
@@ -39,6 +52,7 @@ class SessionManager {
   private chatsByProject = new Map<string, Set<number>>(); // Reverse index for O(1) lookup
   private pendingClonePerChat = new Map<number, PendingClone>();
   private pendingQuestionsPerProject = new Map<string, PendingAskUserQuestion>();
+  private pendingGroupLinks = new Map<number, PendingGroupLink>(); // groupId → pending link
   private currentProject: string = "default";
 
   /**
@@ -200,6 +214,42 @@ class SessionManager {
    */
   clearPendingClone(chatId: number): void {
     this.pendingClonePerChat.delete(chatId);
+  }
+
+  /**
+   * Set pending group link verification state.
+   */
+  setPendingGroupLink(data: PendingGroupLink): void {
+    this.pendingGroupLinks.set(data.groupId, data);
+  }
+
+  /**
+   * Get pending group link verification state.
+   */
+  getPendingGroupLink(groupId: number): PendingGroupLink | null {
+    return this.pendingGroupLinks.get(groupId) || null;
+  }
+
+  /**
+   * Clear pending group link verification state.
+   */
+  clearPendingGroupLink(groupId: number): void {
+    this.pendingGroupLinks.delete(groupId);
+  }
+
+  /**
+   * Clean up expired pending group links (older than 10 minutes).
+   */
+  cleanupExpiredGroupLinks(): void {
+    const now = new Date();
+    const maxAge = 10 * 60 * 1000; // 10 minutes
+
+    for (const [groupId, link] of Array.from(this.pendingGroupLinks)) {
+      const age = now.getTime() - link.createdAt.getTime();
+      if (age > maxAge) {
+        this.pendingGroupLinks.delete(groupId);
+      }
+    }
   }
 
   /**

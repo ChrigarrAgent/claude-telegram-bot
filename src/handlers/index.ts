@@ -16,6 +16,8 @@ export {
   handleProjects,
   handleUsage,
   handleVoice as handleVoiceCommand,
+  handleLink,
+  handleUnlink,
 } from "./commands";
 export { handleText } from "./text";
 export { handleVoice } from "./voice";

@@ -87,3 +87,12 @@ export function clearChatVoiceMode(chatId: number): void {
   delete settingsCache[chatId.toString()];
   saveSettings();
 }
+
+/**
+ * Clear all settings (for testing).
+ */
+export function clearAllSettings(): void {
+  settingsCache = {};
+  cacheLoaded = true;
+  saveSettings();
+}

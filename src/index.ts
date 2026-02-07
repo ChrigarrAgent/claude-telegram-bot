@@ -25,6 +25,8 @@ import {
   handleProjects,
   handleUsage,
   handleVoiceCommand,
+  handleLink,
+  handleUnlink,
   handleText,
   handleVoice,
   handlePhoto,
@@ -363,6 +365,8 @@ bot.command("project", handleProject);
 bot.command("projects", handleProjects);
 bot.command("usage", handleUsage);
 bot.command("voice", handleVoiceCommand);
+bot.command("link", handleLink);
+bot.command("unlink", handleUnlink);
 
 // ============== Message Handlers ==============
 
