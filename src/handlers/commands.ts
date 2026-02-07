@@ -954,12 +954,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
     for (const profile of profiles) {
       const isCurrent = profile.id === currentProfileId;
       const marker = isCurrent ? " ←" : "";
-      const speed = profile.speakingRate < 1 ? "slow" : profile.speakingRate > 1.2 ? "fast" : "normal";
 
       lines.push(
         `${isCurrent ? '▶️' : '  '} <code>${profile.id}</code> - <b>${profile.name}</b>${marker}\n` +
         `   ${profile.description}\n` +
-        `   Speed: ${speed} (${profile.speakingRate}x), Pitch: ${profile.pitch > 0 ? '+' : ''}${profile.pitch}\n`
+        `   Voice: ${profile.voice}\n`
       );
     }
 
@@ -1008,7 +1007,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
     await ctx.reply(
       `✅ Voice profile switched to <b>${profile.name}</b>\n\n` +
       `${profile.description}\n\n` +
-      `Speaking rate: ${profile.speakingRate}x, Pitch: ${profile.pitch > 0 ? '+' : ''}${profile.pitch}\n\n` +
+      `Voice: ${profile.voice}\n\n` +
       `<i>${profile.systemPrompt.split('\n')[0]}</i>`,
       { parse_mode: "HTML" }
     );

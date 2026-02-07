@@ -188,52 +188,52 @@ export async function transcribeVoice(
 
 // ============== Voice Synthesis (TTS) ==============
 
-import { GOOGLE_TTS_API_KEY, GOOGLE_TTS_VOICE, GOOGLE_TTS_LANGUAGE, TTS_MAX_CHARS } from "./config";
+import { GOOGLE_TTS_API_KEY, TTS_MAX_CHARS } from "./config";
 import { trackTTSUsage, isTTSDisabledByUsage } from "./tts-usage";
 import { getVoiceProfile, type VoiceProfile } from "./voice-profiles";
 
 /**
- * Synthesize text to speech using Google Cloud TTS.
+ * Synthesize text to speech using Gemini API TTS.
  * Returns OGG audio buffer or null on failure.
  * Gracefully handles errors (voice mode is optional feature).
  *
  * @param text - Text to synthesize
- * @param profileId - Voice profile ID (default, genz, mentor, etc.)
+ * @param profileId - Voice profile ID (genz, speedrun)
  */
 export async function synthesizeVoice(
   text: string,
-  profileId: string = "default"
+  profileId: string = "genz"
 ): Promise<Buffer | null> {
   if (!GOOGLE_TTS_API_KEY) {
     console.warn("TTS API key not configured");
     return null;
   }
 
-  // Check usage limits
-  if (isTTSDisabledByUsage()) {
-    console.warn("[TTS] Disabled due to usage limits. Use '/voice status' to check usage.");
-    return null;
-  }
+  // NOTE: Gemini API TTS is FREE during preview, so we can disable usage tracking for now
+  // If we want to keep tracking for analytics, we can still call trackTTSUsage()
 
   try {
     // Get voice profile settings
     const profile = getVoiceProfile(profileId);
-    console.log(`[TTS] Using voice profile: ${profile.name} (rate: ${profile.speakingRate}, pitch: ${profile.pitch})`);
+    console.log(`[TTS-Gemini] Using voice: ${profile.voice} (${profile.name})`);
 
-    // Truncate long text
+    // Truncate long text (Gemini has token limits)
     const truncatedText = text.length > TTS_MAX_CHARS
       ? text.slice(0, TTS_MAX_CHARS) + "..."
       : text;
 
-    // Remove markdown formatting for better voice output
+    // Clean text - remove markdown and problematic formatting
+    // NOTE: The voice profile's system prompt should prevent most of this,
+    // but we clean as a safety net
     const cleanedText = truncatedText
-      .replace(/```[\s\S]*?```/g, "[code block]") // Remove code blocks
+      .replace(/```[\s\S]*?```/g, "[code in chat]") // Remove code blocks
       .replace(/`([^`]+)`/g, "$1") // Remove inline code
       .replace(/\*\*([^*]+)\*\*/g, "$1") // Remove bold
       .replace(/\*([^*]+)\*/g, "$1") // Remove italics
       .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1") // Convert links to text
       .replace(/^#+\s+/gm, "") // Remove heading markers
       .replace(/^\s*[-*]\s+/gm, "") // Remove list markers
+      .replace(/https?:\/\/[^\s]+/g, "") // Remove URLs
       .trim();
 
     if (!cleanedText) {
@@ -241,51 +241,65 @@ export async function synthesizeVoice(
       return null;
     }
 
-    // Build audio config with profile settings
-    const audioConfig: any = {
-      audioEncoding: "OGG_OPUS", // Telegram's preferred format
-      speakingRate: profile.speakingRate,
-      pitch: profile.pitch,
-    };
-
-    // Add volume gain if specified
-    if (profile.volumeGainDb !== undefined) {
-      audioConfig.volumeGainDb = profile.volumeGainDb;
-    }
-
+    // Gemini API TTS request
     const response = await fetch(
-      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GOOGLE_TTS_API_KEY,
+        },
         body: JSON.stringify({
-          input: { text: cleanedText },
-          voice: {
-            languageCode: profile.languageCode,
-            name: profile.voice,
-          },
-          audioConfig,
+          contents: [{
+            parts: [{ text: cleanedText }]
+          }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: profile.voice,
+                }
+              }
+            }
+          }
         }),
       }
     );
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("TTS API error:", response.status, errorText);
+      console.error("[TTS-Gemini] API error:", response.status, errorText);
       return null;
     }
 
-    const data = await response.json() as { audioContent?: string };
-    if (!data.audioContent) {
-      console.error("TTS response missing audioContent");
+    const data = await response.json() as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{
+            inlineData?: {
+              data?: string;
+              mimeType?: string;
+            }
+          }>
+        }
+      }>
+    };
+
+    // Extract audio from Gemini response
+    const audioData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+    if (!audioData) {
+      console.error("[TTS-Gemini] Response missing audio data");
       return null;
     }
 
-    // Track usage (characters sent to API)
+    // Track usage for analytics (even though it's free)
     trackTTSUsage(cleanedText.length);
 
     // Decode base64 to buffer
-    return Buffer.from(data.audioContent, "base64");
+    return Buffer.from(audioData, "base64");
   } catch (error) {
     console.error("TTS synthesis failed:", error);
     return null;

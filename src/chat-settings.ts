@@ -94,7 +94,7 @@ export function clearChatVoiceMode(chatId: number): void {
  */
 export function getVoiceProfile(chatId: number): string {
   loadSettings();
-  return settingsCache[chatId.toString()]?.voiceProfile ?? "default";
+  return settingsCache[chatId.toString()]?.voiceProfile ?? "genz";
 }
 
 /**
