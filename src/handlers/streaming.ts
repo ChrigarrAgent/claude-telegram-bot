@@ -134,16 +134,20 @@ async function sendVoiceMessage(ctx: Context, text: string): Promise<void> {
     const { synthesizeVoice } = await import("../utils");
 
     const profileId = getVoiceProfile(chatId);
-    const audioBuffer = await synthesizeVoice(text, profileId);
+    const result = await synthesizeVoice(text, profileId);
 
-    if (!audioBuffer) {
-      console.warn("Voice synthesis failed, skipping voice message");
+    // Check if synthesis failed
+    if (!result || (typeof result === 'object' && 'error' in result)) {
+      const errorMsg = result && 'error' in result ? result.error : 'Unknown error';
+      console.warn("[Voice] Synthesis failed:", errorMsg);
+      // Send error message to user instead of empty voice
+      await ctx.reply(`⚠️ Voice generation failed: ${errorMsg}`, { reply_to_message_id: ctx.message?.message_id });
       return;
     }
 
     // Send voice message via Telegram
     await ctx.replyWithVoice(
-      new InputFile(audioBuffer, "response.ogg"),
+      new InputFile(result, "response.ogg"),
       { caption: "🔊 Voice response" }
     );
   } catch (error) {
@@ -165,16 +169,20 @@ async function sendVoiceMessageViaApi(
     const { synthesizeVoice } = await import("../utils");
 
     const profileId = getVoiceProfile(chatId);
-    const audioBuffer = await synthesizeVoice(text, profileId);
+    const result = await synthesizeVoice(text, profileId);
 
-    if (!audioBuffer) {
-      console.warn("Voice synthesis failed, skipping voice message");
+    // Check if synthesis failed
+    if (!result || (typeof result === 'object' && 'error' in result)) {
+      const errorMsg = result && 'error' in result ? result.error : 'Unknown error';
+      console.warn("[Voice] Synthesis failed:", errorMsg);
+      // Send error message to user instead of empty voice
+      await api.sendMessage(chatId, `⚠️ Voice generation failed: ${errorMsg}`);
       return;
     }
 
     await api.sendVoice(
       chatId,
-      new InputFile(audioBuffer, "response.ogg"),
+      new InputFile(result, "response.ogg"),
       { caption: "🔊 Voice response" }
     );
   } catch (error) {

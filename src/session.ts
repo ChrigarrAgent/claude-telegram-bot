@@ -268,23 +268,8 @@ export class ClaudeSession {
       messageToSend = datePrefix + messageToSend;
     }
 
-    // Check if voice mode is enabled for this chat and get voice profile
-    let systemPrompt = SYSTEM_PROMPT;
-
-    if (ctx?.chat?.id) {
-      const { getVoiceMode, getVoiceProfile: getChatVoiceProfile } = await import("./chat-settings");
-      const voiceEnabled = getVoiceMode(ctx.chat.id);
-
-      if (voiceEnabled) {
-        const { getVoiceProfile } = await import("./voice-profiles");
-        const profileId = getChatVoiceProfile(ctx.chat.id);
-        const profile = getVoiceProfile(profileId);
-
-        // Add voice profile's personality prompt
-        systemPrompt = SYSTEM_PROMPT + "\n\n" + profile.systemPrompt;
-        console.log(`[SESSION] Voice mode ON with profile: ${profile.name}`);
-      }
-    }
+    // Use standard system prompt - voice rewriting is handled by Gemini, not Claude
+    const systemPrompt = SYSTEM_PROMPT;
 
     // Build SDK V1 options - supports all features
     const options: Options = {

@@ -193,57 +193,86 @@ import { trackTTSUsage, isTTSDisabledByUsage } from "./tts-usage";
 import { getVoiceProfile, type VoiceProfile } from "./voice-profiles";
 
 /**
- * Synthesize text to speech using Gemini API TTS.
- * Returns OGG audio buffer or null on failure.
- * Gracefully handles errors (voice mode is optional feature).
+ * Synthesize text to speech using Gemini API with LLM rewrite.
  *
- * @param text - Text to synthesize
+ * NEW APPROACH:
+ * 1. Takes Claude's normal output (with markdown, URLs, etc.)
+ * 2. Uses Gemini LLM to rewrite it for conversational speech
+ * 3. Generates audio from the rewritten text
+ *
+ * This way Claude doesn't need voice-specific system prompts!
+ *
+ * @param text - Claude's normal output text
  * @param profileId - Voice profile ID (genz, speedrun)
+ * @returns Audio buffer or error message
  */
 export async function synthesizeVoice(
   text: string,
   profileId: string = "genz"
-): Promise<Buffer | null> {
+): Promise<Buffer | { error: string }> {
   if (!GOOGLE_TTS_API_KEY) {
-    console.warn("TTS API key not configured");
-    return null;
+    console.warn("[TTS] API key not configured");
+    return { error: "TTS API key not configured" };
   }
-
-  // NOTE: Gemini API TTS is FREE during preview, so we can disable usage tracking for now
-  // If we want to keep tracking for analytics, we can still call trackTTSUsage()
 
   try {
     // Get voice profile settings
     const profile = getVoiceProfile(profileId);
     console.log(`[TTS-Gemini] Using voice: ${profile.voice} (${profile.name})`);
 
-    // Truncate long text (Gemini has token limits)
+    // Truncate if too long
     const truncatedText = text.length > TTS_MAX_CHARS
       ? text.slice(0, TTS_MAX_CHARS) + "..."
       : text;
 
-    // Clean text - remove markdown and problematic formatting
-    // NOTE: The voice profile's system prompt should prevent most of this,
-    // but we clean as a safety net
-    const cleanedText = truncatedText
-      .replace(/```[\s\S]*?```/g, "[code in chat]") // Remove code blocks
-      .replace(/`([^`]+)`/g, "$1") // Remove inline code
-      .replace(/\*\*([^*]+)\*\*/g, "$1") // Remove bold
-      .replace(/\*([^*]+)\*/g, "$1") // Remove italics
-      .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1") // Convert links to text
-      .replace(/^#+\s+/gm, "") // Remove heading markers
-      .replace(/^\s*[-*]\s+/gm, "") // Remove list markers
-      .replace(/https?:\/\/[^\s]+/g, "") // Remove URLs
-      .trim();
+    // STEP 1: Use Gemini LLM to rewrite Claude's output for conversational speech
+    // This removes markdown, URLs, rewrites in conversational tone matching the profile
+    const rewritePrompt = profile.systemPrompt + `\n\nRewrite this message for spoken audio (conversational, no URLs, no markdown):\n\n${truncatedText}`;
 
-    if (!cleanedText) {
-      console.warn("No text left after cleaning for TTS");
-      return null;
+    console.log(`[TTS-Gemini] Step 1: Rewriting text for speech...`);
+
+    const rewriteResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GOOGLE_TTS_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: rewritePrompt }]
+          }]
+        }),
+      }
+    );
+
+    if (!rewriteResponse.ok) {
+      const errorText = await rewriteResponse.text();
+      console.error("[TTS-Gemini] Rewrite error:", rewriteResponse.status, errorText);
+      return { error: `Gemini rewrite failed: ${rewriteResponse.status}` };
     }
 
-    // Gemini API TTS request
-    // IMPORTANT: Gemini TTS requires explicit instruction to speak, not just text
-    const ttsPrompt = `Please read this out loud: ${cleanedText}`;
+    const rewriteData = await rewriteResponse.json() as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{ text?: string }>
+        }
+      }>
+    };
+
+    const speechText = rewriteData.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!speechText) {
+      console.error("[TTS-Gemini] No rewritten text returned");
+      return { error: "Gemini failed to rewrite text" };
+    }
+
+    console.log(`[TTS-Gemini] Step 2: Generating audio from rewritten text...`);
+    console.log(`[TTS-Gemini] Rewritten (${speechText.length} chars): ${speechText.slice(0, 100)}...`);
+
+    // STEP 2: Generate TTS audio from the rewritten text
+    const ttsPrompt = `Read this out loud: ${speechText}`;
 
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent`,
@@ -273,8 +302,8 @@ export async function synthesizeVoice(
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("[TTS-Gemini] API error:", response.status, errorText);
-      return null;
+      console.error("[TTS-Gemini] TTS API error:", response.status, errorText);
+      return { error: `TTS API error: ${response.status}` };
     }
 
     const data = await response.json() as {
@@ -295,17 +324,20 @@ export async function synthesizeVoice(
 
     if (!audioData) {
       console.error("[TTS-Gemini] Response missing audio data");
-      return null;
+      console.error("[TTS-Gemini] Full response:", JSON.stringify(data, null, 2));
+      return { error: "No audio data in response" };
     }
 
     // Track usage for analytics (even though it's free)
-    trackTTSUsage(cleanedText.length);
+    trackTTSUsage(speechText.length);
+
+    console.log(`[TTS-Gemini] ✅ Success! Audio generated (${audioData.length} chars base64)`);
 
     // Decode base64 to buffer
     return Buffer.from(audioData, "base64");
   } catch (error) {
-    console.error("TTS synthesis failed:", error);
-    return null;
+    console.error("[TTS-Gemini] Synthesis failed:", error);
+    return { error: `TTS synthesis failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
