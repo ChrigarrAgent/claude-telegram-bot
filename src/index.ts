@@ -63,8 +63,8 @@ async function autoContinueSession(
     // Without this, Claude may re-execute a restart as part of "continuing",
     // spawning a rogue process outside PM2.
     const continuePrompt = isCrash
-      ? "The bot just restarted after a crash. Please summarize what you were working on before the crash and what the current status is. Do NOT restart the bot or run any commands — just provide a summary to the user."
-      : "The bot just restarted. Please summarize what you were working on and what the current status is. Do NOT restart the bot or run any commands — just provide a summary to the user.";
+      ? "The bot just restarted after a crash. Please continue where you left off. IMPORTANT: Do NOT restart the bot — the restart already happened."
+      : "The bot just restarted. Please continue where you left off. IMPORTANT: Do NOT restart the bot — the restart already happened.";
 
     await projectSession.sendMessage(
       continuePrompt,
