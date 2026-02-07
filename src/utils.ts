@@ -227,7 +227,8 @@ export async function synthesizeVoice(
 
     // STEP 1: Use Gemini LLM to rewrite Claude's output for conversational speech
     // This removes markdown, URLs, rewrites in conversational tone matching the profile
-    const rewritePrompt = profile.systemPrompt + `\n\nRewrite this message for spoken audio (conversational, no URLs, no markdown):\n\n${truncatedText}`;
+    // IMPORTANT: Limit output to ~800 chars for 1-minute voice message
+    const rewritePrompt = profile.systemPrompt + `\n\nRewrite this message for spoken audio (conversational, no URLs, no markdown).\n\nIMPORTANT: Keep your rewrite to approximately 800 characters maximum - this creates a 1-minute voice message. Be concise!\n\nMessage to rewrite:\n\n${truncatedText}`;
 
     console.log(`[TTS-Gemini] Step 1: Rewriting text for speech...`);
 
