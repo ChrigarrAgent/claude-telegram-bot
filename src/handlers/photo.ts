@@ -80,9 +80,9 @@ async function processPhotos(
   }
 
   try {
-    // Get global voice mode state
-    const { isVoiceModeEnabled } = await import("../voice-mode-state");
-    const voiceEnabled = isVoiceModeEnabled();
+    // Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
 
     const { response } = await sendMessageWithRetry(
       projectSession,

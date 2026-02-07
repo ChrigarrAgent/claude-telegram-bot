@@ -102,9 +102,9 @@ export async function handleVoice(ctx: Context): Promise<void> {
       projectSession.session.conversationTitle = title;
     }
 
-    // 11. Get global voice mode state
-    const { isVoiceModeEnabled } = await import("../voice-mode-state");
-    const voiceEnabled = isVoiceModeEnabled();
+    // 11. Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
 
     // 12. Send to Claude with retry logic
     const { response } = await sendMessageWithRetry(

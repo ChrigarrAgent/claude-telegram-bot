@@ -291,9 +291,9 @@ export async function handleText(ctx: Context): Promise<void> {
   const stopProcessing = projectSession.session.startProcessing();
 
   try {
-    // 8. Get global voice mode state
-    const { isVoiceModeEnabled } = await import("../voice-mode-state");
-    const voiceEnabled = isVoiceModeEnabled();
+    // 8. Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
 
     // 9. Send to Claude with retry logic
     const { response } = await sendMessageWithRetry(

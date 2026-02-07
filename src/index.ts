@@ -55,9 +55,9 @@ async function autoContinueSession(
     const { getProjectAlias } = await import("./project-aliases");
     const projectAlias = getProjectAlias(projectSession.workingDir);
 
-    // Check if voice mode is enabled globally
-    const { isVoiceModeEnabled } = await import("./voice-mode-state");
-    const voiceEnabled = isVoiceModeEnabled();
+    // Check if voice mode is enabled for this chat
+    const { getVoiceMode } = await import("./chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
 
     // Use consolidated status callback (same pattern as normal message flow)
     const statusCallback = createBotApiStatusCallback(bot.api, chatId, projectAlias, voiceEnabled);
@@ -235,9 +235,9 @@ async function handleProcessCompletion(status: LongRunStatus): Promise<void> {
     // Send synthetic message to Claude to read the log and continue
     const primaryChatId = chatIds[0]!;
 
-    // Check if voice mode is enabled globally
-    const { isVoiceModeEnabled } = await import("./voice-mode-state");
-    const voiceEnabled = isVoiceModeEnabled();
+    // Check if voice mode is enabled for this chat
+    const { getVoiceMode } = await import("./chat-settings");
+    const voiceEnabled = getVoiceMode(primaryChatId);
 
     // Use consolidated status callback (same pattern as normal message flow)
     const statusCallback = createBotApiStatusCallback(bot.api, primaryChatId, projectAlias, voiceEnabled);

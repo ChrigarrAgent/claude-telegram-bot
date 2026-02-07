@@ -861,20 +861,24 @@ export async function handleRetry(ctx: Context): Promise<void> {
 }
 
 /**
- * /voice - Toggle voice mode (TTS output) globally.
+ * /voice [on|off|clear] - Toggle voice mode.
+ *
+ * In DM: Sets voice mode for DM and ALL linked groups
+ * In Group: Sets voice mode for this group only
  */
 export async function handleVoice(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
 
   if (!isAuthorized(userId, ALLOWED_USERS)) {
     await ctx.reply("Unauthorized.");
     return;
   }
 
-  // Import voice mode state
-  const { toggleVoiceMode } = await import("../voice-mode-state");
-  const { TTS_AVAILABLE } = await import("../config");
+  if (!chatId) return;
 
+  const { TTS_AVAILABLE } = await import("../config");
   if (!TTS_AVAILABLE) {
     await ctx.reply(
       "❌ <b>Voice mode not available</b>\n\n" +
@@ -888,11 +892,83 @@ export async function handleVoice(ctx: Context): Promise<void> {
     return;
   }
 
-  const newState = toggleVoiceMode();
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  const { getVoiceMode, setChatVoiceMode, clearChatVoiceMode } = await import("../chat-settings");
+  const { getAllGroupLinks } = await import("../group-links");
 
-  if (newState) {
-    await ctx.reply("🔊 Voice mode turned on");
+  // Parse args
+  const text = ctx.message?.text || "";
+  const args = text.split(/\s+/).slice(1);
+  const command = args[0]?.toLowerCase();
+
+  // Show status if no args
+  if (!command) {
+    const current = getVoiceMode(chatId);
+    await ctx.reply(
+      `🔊 <b>Voice Mode</b>\n\n` +
+      `Current: ${current ? 'ON 🔊' : 'OFF 🔇'}\n\n` +
+      `<b>Usage:</b>\n` +
+      `<code>/voice on</code> - Enable voice responses\n` +
+      `<code>/voice off</code> - Disable voice responses\n` +
+      (isGroup ? `<code>/voice clear</code> - Reset to default\n\n` : '\n') +
+      (isGroup
+        ? `<i>Changes apply to this group only.</i>`
+        : `<i>Changes apply to DM and all linked groups.</i>`
+      ),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Handle clear (groups only)
+  if (command === 'clear') {
+    if (!isGroup) {
+      await ctx.reply("Clear is only for groups.");
+      return;
+    }
+
+    clearChatVoiceMode(chatId);
+    await ctx.reply(`✅ Voice mode reset to default (OFF)`);
+    return;
+  }
+
+  // Validate on/off
+  if (command !== 'on' && command !== 'off') {
+    await ctx.reply(
+      `Invalid. Use:\n` +
+      `<code>/voice on</code>\n` +
+      `<code>/voice off</code>\n` +
+      (isGroup ? `<code>/voice clear</code>` : ''),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const enable = command === 'on';
+
+  if (isGroup) {
+    // Group: Set for this group only
+    setChatVoiceMode(chatId, enable);
+    await ctx.reply(
+      `${enable ? '🔊' : '🔇'} Voice mode ${enable ? 'enabled' : 'disabled'} for this group.`
+    );
   } else {
-    await ctx.reply("🔇 Voice mode turned off");
+    // DM: Set for DM + propagate to all linked groups
+    setChatVoiceMode(chatId, enable);
+
+    // Propagate to all linked groups
+    const allGroups = getAllGroupLinks();
+    let groupCount = 0;
+    for (const [groupId] of Array.from(allGroups)) {
+      setChatVoiceMode(groupId, enable);
+      groupCount++;
+    }
+
+    await ctx.reply(
+      `${enable ? '🔊' : '🔇'} Voice mode ${enable ? 'enabled' : 'disabled'}.\n\n` +
+      `Applied to DM and ${groupCount} linked group(s).\n\n` +
+      `<i>Groups can still override individually with /voice.</i>`,
+      { parse_mode: "HTML" }
+    );
   }
 }
