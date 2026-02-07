@@ -45,8 +45,7 @@ const bot = new Bot(TELEGRAM_TOKEN);
  */
 async function autoContinueSession(
   projectSession: ProjectSession,
-  chatId: number,
-  isCrash: boolean
+  chatId: number
 ): Promise<void> {
   try {
     console.log(`Auto-continuing session for chat ${chatId}...`);
@@ -62,9 +61,7 @@ async function autoContinueSession(
     // IMPORTANT: Explicitly tell Claude NOT to restart the bot again.
     // Without this, Claude may re-execute a restart as part of "continuing",
     // spawning a rogue process outside PM2.
-    const continuePrompt = isCrash
-      ? "The bot just restarted after a crash. Please continue where you left off. IMPORTANT: Do NOT restart the bot — the restart already happened."
-      : "The bot just restarted. Please continue where you left off. IMPORTANT: Do NOT restart the bot — the restart already happened.";
+    const continuePrompt = "The bot just restarted. Please continue where you left off. IMPORTANT: Do NOT restart the bot — the restart already happened.";
 
     await projectSession.sendMessage(
       continuePrompt,
@@ -506,7 +503,7 @@ if (existsSync(HEARTBEAT_FILE)) {
               console.log(`Resumed crashed session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
 
               // Automatically continue the session
-              await autoContinueSession(projectSession, sess.chat_id, true);
+              await autoContinueSession(projectSession, sess.chat_id);
             } else {
               console.warn(`Failed to resume crashed session for chat ${sess.chat_id}: ${message}`);
             }
@@ -568,7 +565,7 @@ if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
               console.log(`Auto-continuing session ${sess.session_id.slice(0, 8)}... for chat ${sess.chat_id}`);
 
               // Automatically continue the session
-              await autoContinueSession(projectSession, sess.chat_id, false);
+              await autoContinueSession(projectSession, sess.chat_id);
             } else {
               console.warn(`Failed to resume session for chat ${sess.chat_id}: ${message}`);
             }
