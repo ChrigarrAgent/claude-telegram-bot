@@ -291,17 +291,23 @@ export async function handleText(ctx: Context): Promise<void> {
   const stopProcessing = projectSession.session.startProcessing();
 
   try {
-    // 8. Send to Claude with retry logic
+    // 8. Get global voice mode state
+    const { isVoiceModeEnabled } = await import("../voice-mode-state");
+    const voiceEnabled = isVoiceModeEnabled();
+
+    // 9. Send to Claude with retry logic
     const { response } = await sendMessageWithRetry(
       projectSession,
       message,
       username,
       userId,
       ctx,
-      chatId
+      chatId,
+      1,
+      voiceEnabled
     );
 
-    // 9. Update project activity (lastUsed already set above)
+    // 10. Update project activity (lastUsed already set above)
     projectSession.updateActivity();
 
     // 10. Audit log

@@ -41,6 +41,7 @@ export async function handleStart(ctx: Context): Promise<void> {
       `/usage - Show token usage &amp; costs\n` +
       `/resume - Resume saved session\n` +
       `/retry - Retry last message\n` +
+      `/voice - Toggle voice responses\n` +
       `/restart - Restart the bot\n\n` +
       `<b>Project Commands:</b>\n` +
       `/projects - List all available projects\n` +
@@ -857,4 +858,41 @@ export async function handleRetry(ctx: Context): Promise<void> {
   } as Context;
 
   await handleText(fakeCtx);
+}
+
+/**
+ * /voice - Toggle voice mode (TTS output) globally.
+ */
+export async function handleVoice(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  // Import voice mode state
+  const { toggleVoiceMode } = await import("../voice-mode-state");
+  const { TTS_AVAILABLE } = await import("../config");
+
+  if (!TTS_AVAILABLE) {
+    await ctx.reply(
+      "❌ <b>Voice mode not available</b>\n\n" +
+        "Set <code>GOOGLE_TTS_API_KEY</code> in your environment to enable voice responses.\n\n" +
+        "Get an API key:\n" +
+        "1. Go to https://console.cloud.google.com/\n" +
+        "2. Enable Text-to-Speech API\n" +
+        "3. Create API key in Credentials",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const newState = toggleVoiceMode();
+
+  if (newState) {
+    await ctx.reply("🔊 Voice mode turned on");
+  } else {
+    await ctx.reply("🔇 Voice mode turned off");
+  }
 }

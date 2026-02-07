@@ -244,8 +244,8 @@ export const BLOCKED_PATTERNS = [
   "dd if=",
 ];
 
-// Query timeout (3 minutes)
-export const QUERY_TIMEOUT_MS = 180_000;
+// Query timeout (10 minutes)
+export const QUERY_TIMEOUT_MS = 600_000;
 
 // ============== Voice Transcription ==============
 
@@ -260,6 +260,28 @@ export const TRANSCRIPTION_PROMPT = TRANSCRIPTION_CONTEXT
   : BASE_TRANSCRIPTION_PROMPT;
 
 export const TRANSCRIPTION_AVAILABLE = TRANSCRIPTION_PROVIDER !== "none";
+
+// ============== Voice Synthesis (TTS) ==============
+
+export const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || "";
+export const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Neural2-J";
+export const GOOGLE_TTS_LANGUAGE = process.env.GOOGLE_TTS_LANGUAGE || "en-US";
+export const TTS_AVAILABLE = GOOGLE_TTS_API_KEY.length > 0;
+export const TTS_MAX_CHARS = 3000; // Truncate very long responses before TTS
+
+// Voice-optimized system prompt addon
+export const VOICE_MODE_PROMPT = `
+VOICE MODE IS ENABLED: Your final summary/response will be converted to speech.
+
+Requirements for voice output:
+- Be VERY CONCISE but include all important information
+- Provide CONCEPTUAL explanations (what changed, why it matters) NOT file-level details
+- Explain what the code DOES, don't describe file names or line numbers
+- Speak naturally as if explaining to a colleague
+- The text version will have all code/formatting details, so focus on the high-level summary for voice
+
+Example: Instead of "I modified src/utils.ts line 45 to add error handling", say "I added error handling to the voice synthesis function so it fails gracefully if the API is unavailable."
+`;
 
 // ============== Thinking Keywords ==============
 

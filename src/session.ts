@@ -268,6 +268,13 @@ export class ClaudeSession {
       messageToSend = datePrefix + messageToSend;
     }
 
+    // Check if voice mode is enabled globally
+    const { isVoiceModeEnabled } = await import("./voice-mode-state");
+    const { VOICE_MODE_PROMPT } = await import("./config");
+    const systemPrompt = isVoiceModeEnabled()
+      ? SYSTEM_PROMPT + "\n\n" + VOICE_MODE_PROMPT
+      : SYSTEM_PROMPT;
+
     // Build SDK V1 options - supports all features
     const options: Options = {
       model: "claude-sonnet-4-5",
@@ -275,7 +282,7 @@ export class ClaudeSession {
       settingSources: ["user", "project"],
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt: systemPrompt,
       mcpServers: MCP_SERVERS,
       // Only include maxThinkingTokens when defined (undefined = SDK default = thinking OFF)
       ...(thinkingTokens !== undefined && { maxThinkingTokens: thinkingTokens }),

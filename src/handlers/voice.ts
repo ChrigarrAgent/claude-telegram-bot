@@ -102,14 +102,20 @@ export async function handleVoice(ctx: Context): Promise<void> {
       projectSession.session.conversationTitle = title;
     }
 
-    // 11. Send to Claude with retry logic
+    // 11. Get global voice mode state
+    const { isVoiceModeEnabled } = await import("../voice-mode-state");
+    const voiceEnabled = isVoiceModeEnabled();
+
+    // 12. Send to Claude with retry logic
     const { response } = await sendMessageWithRetry(
       projectSession,
       transcript,
       username,
       userId,
       ctx,
-      chatId
+      chatId,
+      1,
+      voiceEnabled
     );
 
     // Update project activity

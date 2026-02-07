@@ -7,7 +7,7 @@
 import type { Context } from "grammy";
 import type { Api } from "grammy";
 import type { Message } from "grammy/types";
-import { InlineKeyboard } from "grammy";
+import { InlineKeyboard, InputFile } from "grammy";
 import type { StatusCallback, StatusType } from "../types";
 import { convertMarkdownToHtml, escapeHtml } from "../formatting";
 import {
@@ -122,6 +122,58 @@ async function sendLongMessage(
 }
 
 /**
+ * Send a voice message for the given text.
+ * Fails gracefully if TTS unavailable or errors occur.
+ */
+async function sendVoiceMessage(ctx: Context, text: string): Promise<void> {
+  try {
+    const { synthesizeVoice } = await import("../utils");
+    const audioBuffer = await synthesizeVoice(text);
+
+    if (!audioBuffer) {
+      console.warn("Voice synthesis failed, skipping voice message");
+      return;
+    }
+
+    // Send voice message via Telegram
+    await ctx.replyWithVoice(
+      new InputFile(audioBuffer, "response.ogg"),
+      { caption: "🔊 Voice response" }
+    );
+  } catch (error) {
+    console.error("Failed to send voice message:", error);
+    // Fail silently - text message was already sent successfully
+  }
+}
+
+/**
+ * Send a voice message via Bot API (no ctx needed).
+ */
+async function sendVoiceMessageViaApi(
+  api: Api,
+  chatId: number,
+  text: string
+): Promise<void> {
+  try {
+    const { synthesizeVoice } = await import("../utils");
+    const audioBuffer = await synthesizeVoice(text);
+
+    if (!audioBuffer) {
+      console.warn("Voice synthesis failed, skipping voice message");
+      return;
+    }
+
+    await api.sendVoice(
+      chatId,
+      new InputFile(audioBuffer, "response.ogg"),
+      { caption: "🔊 Voice response" }
+    );
+  } catch (error) {
+    console.error("Failed to send voice message via API:", error);
+  }
+}
+
+/**
  * Create inline keyboard for ask_user options.
  */
 export function createAskUserKeyboard(
@@ -210,7 +262,8 @@ export class StreamingState {
 export function createStatusCallback(
   ctx: Context,
   state: StreamingState,
-  projectAlias: string = "default"
+  projectAlias: string = "default",
+  voiceEnabled: boolean = false
 ): StatusCallback {
   return async (statusType: StatusType, content: string, segmentId?: number) => {
     try {
@@ -261,6 +314,11 @@ export function createStatusCallback(
         if (state.finalTextSegments.length > 0) {
           const finalText = state.finalTextSegments.join("\n\n");
           await sendLongMessage(ctx, finalText, projectAlias);
+
+          // Voice mode - synthesize and send voice message
+          if (voiceEnabled) {
+            await sendVoiceMessage(ctx, finalText);
+          }
         }
       }
     } catch (error) {
@@ -425,7 +483,8 @@ async function sendLongMessageViaApi(
 export function createBotApiStatusCallback(
   api: Api,
   chatId: number,
-  projectAlias: string = "default"
+  projectAlias: string = "default",
+  voiceEnabled: boolean = false
 ): StatusCallback {
   const state = new StreamingState();
 
@@ -464,6 +523,11 @@ export function createBotApiStatusCallback(
         if (state.finalTextSegments.length > 0) {
           const finalText = state.finalTextSegments.join("\n\n");
           await sendLongMessageViaApi(api, chatId, finalText, projectAlias);
+
+          // Voice mode - synthesize and send voice message
+          if (voiceEnabled) {
+            await sendVoiceMessageViaApi(api, chatId, finalText);
+          }
         }
       }
     } catch (error) {

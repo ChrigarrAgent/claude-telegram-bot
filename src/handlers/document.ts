@@ -274,6 +274,10 @@ async function processArchive(
       projectSession.session.conversationTitle = title;
     }
 
+    // Get global voice mode state
+    const { isVoiceModeEnabled } = await import("../voice-mode-state");
+    const voiceEnabled = isVoiceModeEnabled();
+
     // Send with retry logic
     const { response } = await sendMessageWithRetry(
       projectSession,
@@ -281,7 +285,9 @@ async function processArchive(
       username,
       userId,
       ctx,
-      chatId
+      chatId,
+      1,
+      voiceEnabled
     );
 
     projectSession.updateActivity();
@@ -364,13 +370,19 @@ async function processDocuments(
   }
 
   try {
+    // Get global voice mode state
+    const { isVoiceModeEnabled } = await import("../voice-mode-state");
+    const voiceEnabled = isVoiceModeEnabled();
+
     const { response, state } = await sendMessageWithRetry(
       projectSession,
       prompt,
       username,
       userId,
       ctx,
-      chatId
+      chatId,
+      1,
+      voiceEnabled
     );
 
     projectSession.updateActivity();

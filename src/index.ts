@@ -24,6 +24,7 @@ import {
   handleProject,
   handleProjects,
   handleUsage,
+  handleVoiceCommand,
   handleText,
   handleVoice,
   handlePhoto,
@@ -54,8 +55,12 @@ async function autoContinueSession(
     const { getProjectAlias } = await import("./project-aliases");
     const projectAlias = getProjectAlias(projectSession.workingDir);
 
+    // Check if voice mode is enabled globally
+    const { isVoiceModeEnabled } = await import("./voice-mode-state");
+    const voiceEnabled = isVoiceModeEnabled();
+
     // Use consolidated status callback (same pattern as normal message flow)
-    const statusCallback = createBotApiStatusCallback(bot.api, chatId, projectAlias);
+    const statusCallback = createBotApiStatusCallback(bot.api, chatId, projectAlias, voiceEnabled);
 
     // Send the continue message to Claude
     // IMPORTANT: Explicitly tell Claude NOT to restart the bot again.
@@ -230,8 +235,12 @@ async function handleProcessCompletion(status: LongRunStatus): Promise<void> {
     // Send synthetic message to Claude to read the log and continue
     const primaryChatId = chatIds[0]!;
 
+    // Check if voice mode is enabled globally
+    const { isVoiceModeEnabled } = await import("./voice-mode-state");
+    const voiceEnabled = isVoiceModeEnabled();
+
     // Use consolidated status callback (same pattern as normal message flow)
-    const statusCallback = createBotApiStatusCallback(bot.api, primaryChatId, projectAlias);
+    const statusCallback = createBotApiStatusCallback(bot.api, primaryChatId, projectAlias, voiceEnabled);
 
     const logFile = `/tmp/long-run/${status.id}.log`;
     const prompt =
@@ -353,6 +362,7 @@ bot.command("tmux", handleTmux);
 bot.command("project", handleProject);
 bot.command("projects", handleProjects);
 bot.command("usage", handleUsage);
+bot.command("voice", handleVoiceCommand);
 
 // ============== Message Handlers ==============
 

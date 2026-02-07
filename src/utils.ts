@@ -186,6 +186,83 @@ export async function transcribeVoice(
   }
 }
 
+// ============== Voice Synthesis (TTS) ==============
+
+import { GOOGLE_TTS_API_KEY, GOOGLE_TTS_VOICE, GOOGLE_TTS_LANGUAGE, TTS_MAX_CHARS } from "./config";
+
+/**
+ * Synthesize text to speech using Google Cloud TTS.
+ * Returns OGG audio buffer or null on failure.
+ * Gracefully handles errors (voice mode is optional feature).
+ */
+export async function synthesizeVoice(text: string): Promise<Buffer | null> {
+  if (!GOOGLE_TTS_API_KEY) {
+    console.warn("TTS API key not configured");
+    return null;
+  }
+
+  try {
+    // Truncate long text
+    const truncatedText = text.length > TTS_MAX_CHARS
+      ? text.slice(0, TTS_MAX_CHARS) + "..."
+      : text;
+
+    // Remove markdown formatting for better voice output
+    const cleanedText = truncatedText
+      .replace(/```[\s\S]*?```/g, "[code block]") // Remove code blocks
+      .replace(/`([^`]+)`/g, "$1") // Remove inline code
+      .replace(/\*\*([^*]+)\*\*/g, "$1") // Remove bold
+      .replace(/\*([^*]+)\*/g, "$1") // Remove italics
+      .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1") // Convert links to text
+      .replace(/^#+\s+/gm, "") // Remove heading markers
+      .replace(/^\s*[-*]\s+/gm, "") // Remove list markers
+      .trim();
+
+    if (!cleanedText) {
+      console.warn("No text left after cleaning for TTS");
+      return null;
+    }
+
+    const response = await fetch(
+      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: { text: cleanedText },
+          voice: {
+            languageCode: GOOGLE_TTS_LANGUAGE,
+            name: GOOGLE_TTS_VOICE,
+          },
+          audioConfig: {
+            audioEncoding: "OGG_OPUS", // Telegram's preferred format
+            speakingRate: 1.0,
+            pitch: 0.0,
+          },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("TTS API error:", response.status, errorText);
+      return null;
+    }
+
+    const data = await response.json() as { audioContent?: string };
+    if (!data.audioContent) {
+      console.error("TTS response missing audioContent");
+      return null;
+    }
+
+    // Decode base64 to buffer
+    return Buffer.from(data.audioContent, "base64");
+  } catch (error) {
+    console.error("TTS synthesis failed:", error);
+    return null;
+  }
+}
+
 // ============== Typing Indicator ==============
 
 export interface TypingController {
