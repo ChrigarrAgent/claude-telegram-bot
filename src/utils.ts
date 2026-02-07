@@ -242,6 +242,9 @@ export async function synthesizeVoice(
     }
 
     // Gemini API TTS request
+    // IMPORTANT: Gemini TTS requires explicit instruction to speak, not just text
+    const ttsPrompt = `Please read this out loud: ${cleanedText}`;
+
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent`,
       {
@@ -252,7 +255,7 @@ export async function synthesizeVoice(
         },
         body: JSON.stringify({
           contents: [{
-            parts: [{ text: cleanedText }]
+            parts: [{ text: ttsPrompt }]
           }],
           generationConfig: {
             responseModalities: ["AUDIO"],
