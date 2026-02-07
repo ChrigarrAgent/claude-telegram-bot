@@ -861,7 +861,17 @@ export async function handleRetry(ctx: Context): Promise<void> {
 }
 
 /**
- * /voice [on|off|clear] - Toggle voice mode.
+ * Generate a progress bar for usage display.
+ */
+function generateProgressBar(percent: number, length: number = 20): string {
+  const filled = Math.round((percent / 100) * length);
+  const empty = length - filled;
+  const bar = '█'.repeat(filled) + '░'.repeat(empty);
+  return `[${bar}]`;
+}
+
+/**
+ * /voice [on|off|clear|status|override] - Toggle voice mode and track usage.
  *
  * In DM: Sets voice mode for DM and ALL linked groups
  * In Group: Sets voice mode for this group only
@@ -895,6 +905,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
   const isGroup = chatType === 'group' || chatType === 'supergroup';
   const { getVoiceMode, setChatVoiceMode, clearChatVoiceMode } = await import("../chat-settings");
   const { getAllGroupLinks } = await import("../group-links");
+  const { getTTSUsageStats, setTTSDisabled } = await import("../tts-usage");
 
   // Parse args
   const text = ctx.message?.text || "";
@@ -910,11 +921,53 @@ export async function handleVoice(ctx: Context): Promise<void> {
       `<b>Usage:</b>\n` +
       `<code>/voice on</code> - Enable voice responses\n` +
       `<code>/voice off</code> - Disable voice responses\n` +
+      `<code>/voice status</code> - Check TTS usage stats\n` +
       (isGroup ? `<code>/voice clear</code> - Reset to default\n\n` : '\n') +
       (isGroup
         ? `<i>Changes apply to this group only.</i>`
         : `<i>Changes apply to DM and all linked groups.</i>`
       ),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Handle status
+  if (command === 'status') {
+    const stats = getTTSUsageStats();
+    const percentBar = generateProgressBar(stats.percentUsed, 20);
+
+    await ctx.reply(
+      `📊 <b>TTS Usage Statistics</b>\n\n` +
+      `<b>Month:</b> ${stats.month}\n` +
+      `<b>Characters used:</b> ${stats.charactersUsed.toLocaleString()} / ${stats.monthlyLimit.toLocaleString()}\n` +
+      `<b>Requests:</b> ${stats.requestCount.toLocaleString()}\n` +
+      `<b>Usage:</b> ${stats.percentUsed.toFixed(1)}%\n` +
+      `${percentBar}\n\n` +
+      `<b>Remaining:</b> ${stats.remainingCharacters.toLocaleString()} characters\n` +
+      `<b>Status:</b> ${stats.disabled ? '🔴 DISABLED (limit reached)' : '🟢 Active'}\n\n` +
+      `<i>Auto-disables at ${(stats.willAutoDisableAt).toLocaleString()} characters (98%)</i>\n\n` +
+      (stats.disabled
+        ? `Use <code>/voice override</code> to manually re-enable (not recommended)`
+        : ``),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Handle override (manual re-enable)
+  if (command === 'override') {
+    const stats = getTTSUsageStats();
+    if (!stats.disabled) {
+      await ctx.reply("⚠️ TTS is not currently disabled.");
+      return;
+    }
+
+    setTTSDisabled(false);
+    await ctx.reply(
+      `✅ TTS manually re-enabled.\n\n` +
+      `⚠️ <b>Warning:</b> You've used ${stats.percentUsed.toFixed(1)}% of your monthly limit.\n` +
+      `Continuing may result in charges if you exceed the free tier.`,
       { parse_mode: "HTML" }
     );
     return;
@@ -932,13 +985,18 @@ export async function handleVoice(ctx: Context): Promise<void> {
     return;
   }
 
-  // Validate on/off
-  if (command !== 'on' && command !== 'off') {
+  // Validate command
+  const validCommands = ['on', 'off', 'status', 'override'];
+  if (isGroup) validCommands.push('clear');
+
+  if (!validCommands.includes(command)) {
     await ctx.reply(
-      `Invalid. Use:\n` +
+      `Invalid command. Use:\n` +
       `<code>/voice on</code>\n` +
       `<code>/voice off</code>\n` +
-      (isGroup ? `<code>/voice clear</code>` : ''),
+      `<code>/voice status</code>\n` +
+      (isGroup ? `<code>/voice clear</code>\n` : '') +
+      `<code>/voice override</code> (if disabled)`,
       { parse_mode: "HTML" }
     );
     return;

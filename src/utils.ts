@@ -189,6 +189,7 @@ export async function transcribeVoice(
 // ============== Voice Synthesis (TTS) ==============
 
 import { GOOGLE_TTS_API_KEY, GOOGLE_TTS_VOICE, GOOGLE_TTS_LANGUAGE, TTS_MAX_CHARS } from "./config";
+import { trackTTSUsage, isTTSDisabledByUsage } from "./tts-usage";
 
 /**
  * Synthesize text to speech using Google Cloud TTS.
@@ -198,6 +199,12 @@ import { GOOGLE_TTS_API_KEY, GOOGLE_TTS_VOICE, GOOGLE_TTS_LANGUAGE, TTS_MAX_CHAR
 export async function synthesizeVoice(text: string): Promise<Buffer | null> {
   if (!GOOGLE_TTS_API_KEY) {
     console.warn("TTS API key not configured");
+    return null;
+  }
+
+  // Check usage limits
+  if (isTTSDisabledByUsage()) {
+    console.warn("[TTS] Disabled due to usage limits. Use '/voice status' to check usage.");
     return null;
   }
 
@@ -254,6 +261,9 @@ export async function synthesizeVoice(text: string): Promise<Buffer | null> {
       console.error("TTS response missing audioContent");
       return null;
     }
+
+    // Track usage (characters sent to API)
+    trackTTSUsage(cleanedText.length);
 
     // Decode base64 to buffer
     return Buffer.from(data.audioContent, "base64");
