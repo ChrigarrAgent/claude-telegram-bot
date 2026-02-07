@@ -954,11 +954,13 @@ export async function handleVoice(ctx: Context): Promise<void> {
     for (const profile of profiles) {
       const isCurrent = profile.id === currentProfileId;
       const marker = isCurrent ? " ←" : "";
+      const promptPreview = profile.systemPrompt.split('\n')[0];
 
       lines.push(
         `${isCurrent ? '▶️' : '  '} <code>${profile.id}</code> - <b>${profile.name}</b>${marker}\n` +
         `   ${profile.description}\n` +
-        `   Voice: ${profile.voice}\n`
+        `   Voice: <b>${profile.voice}</b>\n` +
+        `   <i>${promptPreview}</i>\n`
       );
     }
 
