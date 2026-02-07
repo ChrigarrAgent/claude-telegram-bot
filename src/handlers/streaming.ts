@@ -146,13 +146,19 @@ async function sendVoiceMessage(ctx: Context, text: string): Promise<void> {
     }
 
     // Send voice message via Telegram
+    console.log(`[Voice] Sending ${result.length} bytes to Telegram...`);
     await ctx.replyWithVoice(
       new InputFile(result, "response.ogg"),
       { caption: "🔊 Voice response" }
     );
+    console.log(`[Voice] ✅ Voice message sent successfully`);
   } catch (error) {
-    console.error("Failed to send voice message:", error);
-    // Fail silently - text message was already sent successfully
+    console.error("[Voice] ❌ Failed to send voice message:", error);
+    // Show error to user instead of failing silently
+    await ctx.reply(
+      `⚠️ Voice message failed to send: ${error instanceof Error ? error.message : String(error)}`,
+      { reply_to_message_id: ctx.message?.message_id }
+    ).catch(() => {});
   }
 }
 
@@ -180,13 +186,20 @@ async function sendVoiceMessageViaApi(
       return;
     }
 
+    console.log(`[Voice] Sending ${result.length} bytes to Telegram (via API)...`);
     await api.sendVoice(
       chatId,
       new InputFile(result, "response.ogg"),
       { caption: "🔊 Voice response" }
     );
+    console.log(`[Voice] ✅ Voice message sent successfully (via API)`);
   } catch (error) {
-    console.error("Failed to send voice message via API:", error);
+    console.error("[Voice] ❌ Failed to send voice message via API:", error);
+    // Show error to user
+    await api.sendMessage(
+      chatId,
+      `⚠️ Voice message failed to send: ${error instanceof Error ? error.message : String(error)}`
+    ).catch(() => {});
   }
 }
 
