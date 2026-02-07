@@ -127,8 +127,14 @@ async function sendLongMessage(
  */
 async function sendVoiceMessage(ctx: Context, text: string): Promise<void> {
   try {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    const { getVoiceProfile } = await import("../chat-settings");
     const { synthesizeVoice } = await import("../utils");
-    const audioBuffer = await synthesizeVoice(text);
+
+    const profileId = getVoiceProfile(chatId);
+    const audioBuffer = await synthesizeVoice(text, profileId);
 
     if (!audioBuffer) {
       console.warn("Voice synthesis failed, skipping voice message");
@@ -155,8 +161,11 @@ async function sendVoiceMessageViaApi(
   text: string
 ): Promise<void> {
   try {
+    const { getVoiceProfile } = await import("../chat-settings");
     const { synthesizeVoice } = await import("../utils");
-    const audioBuffer = await synthesizeVoice(text);
+
+    const profileId = getVoiceProfile(chatId);
+    const audioBuffer = await synthesizeVoice(text, profileId);
 
     if (!audioBuffer) {
       console.warn("Voice synthesis failed, skipping voice message");

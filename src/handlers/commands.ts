@@ -915,18 +915,101 @@ export async function handleVoice(ctx: Context): Promise<void> {
   // Show status if no args
   if (!command) {
     const current = getVoiceMode(chatId);
+    const { getVoiceProfile } = await import("../chat-settings");
+    const { getVoiceProfile: getProfile } = await import("../voice-profiles");
+    const profileId = getVoiceProfile(chatId);
+    const profile = getProfile(profileId);
+
     await ctx.reply(
       `🔊 <b>Voice Mode</b>\n\n` +
-      `Current: ${current ? 'ON 🔊' : 'OFF 🔇'}\n\n` +
+      `Current: ${current ? 'ON 🔊' : 'OFF 🔇'}\n` +
+      `Profile: <b>${profile.name}</b> (${profile.description})\n\n` +
       `<b>Usage:</b>\n` +
       `<code>/voice on</code> - Enable voice responses\n` +
       `<code>/voice off</code> - Disable voice responses\n` +
+      `<code>/voice profiles</code> - List voice profiles\n` +
+      `<code>/voice profile &lt;id&gt;</code> - Switch profile\n` +
       `<code>/voice status</code> - Check TTS usage stats\n` +
       (isGroup ? `<code>/voice clear</code> - Reset to default\n\n` : '\n') +
       (isGroup
         ? `<i>Changes apply to this group only.</i>`
         : `<i>Changes apply to DM and all linked groups.</i>`
       ),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Handle profiles list
+  if (command === 'profiles') {
+    const { getAllVoiceProfiles } = await import("../voice-profiles");
+    const { getVoiceProfile } = await import("../chat-settings");
+    const currentProfileId = getVoiceProfile(chatId);
+    const profiles = getAllVoiceProfiles();
+
+    const lines: string[] = [
+      `🎙️ <b>Available Voice Profiles</b>\n`,
+    ];
+
+    for (const profile of profiles) {
+      const isCurrent = profile.id === currentProfileId;
+      const marker = isCurrent ? " ←" : "";
+      const speed = profile.speakingRate < 1 ? "slow" : profile.speakingRate > 1.2 ? "fast" : "normal";
+
+      lines.push(
+        `${isCurrent ? '▶️' : '  '} <code>${profile.id}</code> - <b>${profile.name}</b>${marker}\n` +
+        `   ${profile.description}\n` +
+        `   Speed: ${speed} (${profile.speakingRate}x), Pitch: ${profile.pitch > 0 ? '+' : ''}${profile.pitch}\n`
+      );
+    }
+
+    lines.push(
+      `\n<b>Switch profile:</b>\n` +
+      `<code>/voice profile &lt;id&gt;</code>\n\n` +
+      `Example: <code>/voice profile genz</code>`
+    );
+
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+    return;
+  }
+
+  // Handle profile switch
+  if (command === 'profile') {
+    const profileId = args[1]?.toLowerCase();
+
+    if (!profileId) {
+      await ctx.reply(
+        `❌ Please specify a profile ID.\n\n` +
+        `Usage: <code>/voice profile &lt;id&gt;</code>\n` +
+        `Example: <code>/voice profile genz</code>\n\n` +
+        `Use <code>/voice profiles</code> to see all available profiles.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const { getVoiceProfile: getProfile } = await import("../voice-profiles");
+    const { setVoiceProfile } = await import("../chat-settings");
+    const profile = getProfile(profileId);
+
+    // Check if profile exists (will return default if not found)
+    if (profile.id !== profileId) {
+      await ctx.reply(
+        `❌ Unknown profile: <code>${profileId}</code>\n\n` +
+        `Use <code>/voice profiles</code> to see available profiles.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // Set profile for this chat
+    setVoiceProfile(chatId, profileId);
+
+    await ctx.reply(
+      `✅ Voice profile switched to <b>${profile.name}</b>\n\n` +
+      `${profile.description}\n\n` +
+      `Speaking rate: ${profile.speakingRate}x, Pitch: ${profile.pitch > 0 ? '+' : ''}${profile.pitch}\n\n` +
+      `<i>${profile.systemPrompt.split('\n')[0]}</i>`,
       { parse_mode: "HTML" }
     );
     return;
@@ -986,7 +1069,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
   }
 
   // Validate command
-  const validCommands = ['on', 'off', 'status', 'override'];
+  const validCommands = ['on', 'off', 'status', 'override', 'profiles', 'profile'];
   if (isGroup) validCommands.push('clear');
 
   if (!validCommands.includes(command)) {
@@ -994,6 +1077,8 @@ export async function handleVoice(ctx: Context): Promise<void> {
       `Invalid command. Use:\n` +
       `<code>/voice on</code>\n` +
       `<code>/voice off</code>\n` +
+      `<code>/voice profiles</code>\n` +
+      `<code>/voice profile &lt;id&gt;</code>\n` +
       `<code>/voice status</code>\n` +
       (isGroup ? `<code>/voice clear</code>\n` : '') +
       `<code>/voice override</code> (if disabled)`,

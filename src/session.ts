@@ -268,12 +268,23 @@ export class ClaudeSession {
       messageToSend = datePrefix + messageToSend;
     }
 
-    // Check if voice mode is enabled globally
-    const { isVoiceModeEnabled } = await import("./voice-mode-state");
-    const { VOICE_MODE_PROMPT } = await import("./config");
-    const systemPrompt = isVoiceModeEnabled()
-      ? SYSTEM_PROMPT + "\n\n" + VOICE_MODE_PROMPT
-      : SYSTEM_PROMPT;
+    // Check if voice mode is enabled for this chat and get voice profile
+    let systemPrompt = SYSTEM_PROMPT;
+
+    if (ctx?.chat?.id) {
+      const { getVoiceMode, getVoiceProfile: getChatVoiceProfile } = await import("./chat-settings");
+      const voiceEnabled = getVoiceMode(ctx.chat.id);
+
+      if (voiceEnabled) {
+        const { getVoiceProfile } = await import("./voice-profiles");
+        const profileId = getChatVoiceProfile(ctx.chat.id);
+        const profile = getVoiceProfile(profileId);
+
+        // Add voice profile's personality prompt
+        systemPrompt = SYSTEM_PROMPT + "\n\n" + profile.systemPrompt;
+        console.log(`[SESSION] Voice mode ON with profile: ${profile.name}`);
+      }
+    }
 
     // Build SDK V1 options - supports all features
     const options: Options = {

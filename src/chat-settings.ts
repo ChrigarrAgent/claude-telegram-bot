@@ -12,7 +12,8 @@ const SETTINGS_FILE = `${homedir()}/.claude/telegram-chat-settings.json`;
 
 interface ChatSettings {
   voiceMode?: boolean;
-  // Future: language?: string, ttsVoice?: string, etc.
+  voiceProfile?: string;  // Voice profile ID (default, genz, mentor, etc.)
+  // Future: language?: string, etc.
 }
 
 // Simple map: chatId → settings
@@ -85,6 +86,28 @@ export function setChatVoiceMode(chatId: number, enabled: boolean): void {
 export function clearChatVoiceMode(chatId: number): void {
   loadSettings();
   delete settingsCache[chatId.toString()];
+  saveSettings();
+}
+
+/**
+ * Get voice profile for a chat.
+ */
+export function getVoiceProfile(chatId: number): string {
+  loadSettings();
+  return settingsCache[chatId.toString()]?.voiceProfile ?? "default";
+}
+
+/**
+ * Set voice profile for a chat.
+ */
+export function setVoiceProfile(chatId: number, profileId: string): void {
+  loadSettings();
+
+  if (!settingsCache[chatId.toString()]) {
+    settingsCache[chatId.toString()] = {};
+  }
+
+  settingsCache[chatId.toString()]!.voiceProfile = profileId;
   saveSettings();
 }
 

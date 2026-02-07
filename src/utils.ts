@@ -190,13 +190,20 @@ export async function transcribeVoice(
 
 import { GOOGLE_TTS_API_KEY, GOOGLE_TTS_VOICE, GOOGLE_TTS_LANGUAGE, TTS_MAX_CHARS } from "./config";
 import { trackTTSUsage, isTTSDisabledByUsage } from "./tts-usage";
+import { getVoiceProfile, type VoiceProfile } from "./voice-profiles";
 
 /**
  * Synthesize text to speech using Google Cloud TTS.
  * Returns OGG audio buffer or null on failure.
  * Gracefully handles errors (voice mode is optional feature).
+ *
+ * @param text - Text to synthesize
+ * @param profileId - Voice profile ID (default, genz, mentor, etc.)
  */
-export async function synthesizeVoice(text: string): Promise<Buffer | null> {
+export async function synthesizeVoice(
+  text: string,
+  profileId: string = "default"
+): Promise<Buffer | null> {
   if (!GOOGLE_TTS_API_KEY) {
     console.warn("TTS API key not configured");
     return null;
@@ -209,6 +216,10 @@ export async function synthesizeVoice(text: string): Promise<Buffer | null> {
   }
 
   try {
+    // Get voice profile settings
+    const profile = getVoiceProfile(profileId);
+    console.log(`[TTS] Using voice profile: ${profile.name} (rate: ${profile.speakingRate}, pitch: ${profile.pitch})`);
+
     // Truncate long text
     const truncatedText = text.length > TTS_MAX_CHARS
       ? text.slice(0, TTS_MAX_CHARS) + "..."
@@ -230,6 +241,18 @@ export async function synthesizeVoice(text: string): Promise<Buffer | null> {
       return null;
     }
 
+    // Build audio config with profile settings
+    const audioConfig: any = {
+      audioEncoding: "OGG_OPUS", // Telegram's preferred format
+      speakingRate: profile.speakingRate,
+      pitch: profile.pitch,
+    };
+
+    // Add volume gain if specified
+    if (profile.volumeGainDb !== undefined) {
+      audioConfig.volumeGainDb = profile.volumeGainDb;
+    }
+
     const response = await fetch(
       `https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_API_KEY}`,
       {
@@ -238,14 +261,10 @@ export async function synthesizeVoice(text: string): Promise<Buffer | null> {
         body: JSON.stringify({
           input: { text: cleanedText },
           voice: {
-            languageCode: GOOGLE_TTS_LANGUAGE,
-            name: GOOGLE_TTS_VOICE,
+            languageCode: profile.languageCode,
+            name: profile.voice,
           },
-          audioConfig: {
-            audioEncoding: "OGG_OPUS", // Telegram's preferred format
-            speakingRate: 1.0,
-            pitch: 0.0,
-          },
+          audioConfig,
         }),
       }
     );
