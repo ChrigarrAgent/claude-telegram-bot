@@ -59,9 +59,12 @@ async function autoContinueSession(
     const statusCallback = createBotApiStatusCallback(bot.api, chatId, projectAlias);
 
     // Send the continue message to Claude
+    // IMPORTANT: Explicitly tell Claude NOT to restart the bot again.
+    // Without this, Claude may re-execute a restart as part of "continuing",
+    // spawning a rogue process outside PM2.
     const continuePrompt = isCrash
-      ? "You just restarted after a crash. Please continue where you left off."
-      : "You just restarted the bot. Please continue where you left off.";
+      ? "The bot just restarted after a crash. Please summarize what you were working on before the crash and what the current status is. Do NOT restart the bot or run any commands — just provide a summary to the user."
+      : "The bot just restarted. Please summarize what you were working on and what the current status is. Do NOT restart the bot or run any commands — just provide a summary to the user.";
 
     await projectSession.sendMessage(
       continuePrompt,
