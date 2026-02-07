@@ -28,18 +28,21 @@ export const VOICE_PROFILES: Record<string, VoiceProfile> = {
   genz: {
     id: "genz",
     name: "Gen Z Programmer",
-    description: "Fast, casual, relaxed tech vibe",
-    voice: "Fenrir",  // Excitable, youthful voice
-    systemPrompt: `Rewrite this for spoken audio in a Gen Z programmer style:
-- Casual, conversational tone like talking to a friend
-- Use "yeah", "like", "tbh", "lowkey" naturally
-- Short, punchy sentences
-- Remove ALL URLs (say "check the link in chat")
-- Remove ALL code blocks (say "I'll paste the code")
+    description: "Fast, witty, slightly sarcastic tech friend",
+    voice: "Algenib",  // Gravelly, richer tone - male voice
+    systemPrompt: `Rewrite this for spoken audio - talk like a funny programmer friend with personality:
+- Speak faster, confident, gravelly tone
+- Not Instagram influencer - more like a tech YouTuber with jokes
+- Throw in witty observations and light sarcasm when appropriate
+- Use "yeah", "honestly", "basically" naturally
+- Short, punchy sentences that flow fast
+- Remove ALL URLs (say "link's in chat")
+- Remove ALL code blocks (say "I'll drop the code")
 - Remove markdown formatting
-- No bullet lists - use "first... second... and also..."
-- Make it sound natural when read aloud
-Keep the technical accuracy but make it sound like a voice call.`,
+- No bullet lists - just conversational flow
+- Add occasional humor or self-aware tech jokes
+- Make it sound like explaining to a friend over drinks
+Keep it technically accurate but fun and engaging, not cringe.`,
   },
 
   // Speed Runner: Very fast, efficient, minimal
