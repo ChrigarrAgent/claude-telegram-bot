@@ -332,10 +332,49 @@ export async function synthesizeVoice(
     // Track usage for analytics (even though it's free)
     trackTTSUsage(speechText.length);
 
-    console.log(`[TTS-Gemini] ✅ Success! Audio generated (${audioData.length} chars base64)`);
+    console.log(`[TTS-Gemini] ✅ Audio generated (${audioData.length} chars base64)`);
 
-    // Decode base64 to buffer
-    return Buffer.from(audioData, "base64");
+    // Decode base64 to PCM buffer
+    const pcmBuffer = Buffer.from(audioData, "base64");
+    console.log(`[TTS-Gemini] Decoded PCM: ${pcmBuffer.length} bytes`);
+
+    // Convert PCM to OGG/OPUS for Telegram
+    // Gemini returns: audio/L16;codec=pcm;rate=24000 (16-bit PCM at 24kHz)
+    // Telegram needs: OGG/OPUS format
+    console.log(`[TTS-Gemini] Converting PCM to OGG/OPUS...`);
+
+    const { $ } = await import("bun");
+    const tempPcm = `/tmp/tts-${Date.now()}.pcm`;
+    const tempOgg = `/tmp/tts-${Date.now()}.ogg`;
+
+    try {
+      // Write PCM data to temp file
+      await Bun.write(tempPcm, pcmBuffer);
+
+      // Convert PCM to OGG/OPUS using ffmpeg
+      // -f s16le: 16-bit little-endian PCM
+      // -ar 24000: 24kHz sample rate
+      // -ac 1: mono audio
+      // -c:a libopus: use Opus codec
+      // -b:a 64k: 64kbps bitrate (good for voice)
+      await $`ffmpeg -y -f s16le -ar 24000 -ac 1 -i ${tempPcm} -c:a libopus -b:a 64k ${tempOgg}`.quiet();
+
+      // Read converted OGG file
+      const oggBuffer = await Bun.file(tempOgg).arrayBuffer();
+      const result = Buffer.from(oggBuffer);
+
+      console.log(`[TTS-Gemini] ✅ Converted to OGG/OPUS: ${result.length} bytes`);
+
+      // Clean up temp files
+      await $`rm -f ${tempPcm} ${tempOgg}`.quiet();
+
+      return result;
+    } catch (conversionError) {
+      console.error("[TTS-Gemini] ❌ PCM→OGG conversion failed:", conversionError);
+      // Clean up on error
+      await $`rm -f ${tempPcm} ${tempOgg}`.quiet().catch(() => {});
+      return { error: `Audio conversion failed: ${conversionError instanceof Error ? conversionError.message : String(conversionError)}` };
+    }
   } catch (error) {
     console.error("[TTS-Gemini] Synthesis failed:", error);
     return { error: `TTS synthesis failed: ${error instanceof Error ? error.message : String(error)}` };
