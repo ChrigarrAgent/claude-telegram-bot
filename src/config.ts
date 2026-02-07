@@ -267,7 +267,7 @@ export const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || "";
 export const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Neural2-J";
 export const GOOGLE_TTS_LANGUAGE = process.env.GOOGLE_TTS_LANGUAGE || "en-US";
 export const TTS_AVAILABLE = GOOGLE_TTS_API_KEY.length > 0;
-export const TTS_MAX_CHARS = 3000; // Truncate very long responses before TTS
+export const TTS_MAX_CHARS = 800; // Truncate to keep audio under 5MB (Telegram limit)
 
 // Voice-optimized system prompt addon
 export const VOICE_MODE_PROMPT = `
