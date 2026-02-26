@@ -198,12 +198,13 @@ import { getVoiceProfile, type VoiceProfile } from "./voice-profiles";
  * NEW APPROACH:
  * 1. Takes Claude's normal output (with markdown, URLs, etc.)
  * 2. Uses Gemini LLM to rewrite it for conversational speech
- * 3. Generates audio from the rewritten text
+ * 3. Translates if global language override is set
+ * 4. Generates audio from the rewritten text
  *
  * This way Claude doesn't need voice-specific system prompts!
  *
  * @param text - Claude's normal output text
- * @param profileId - Voice profile ID (genz, speedrun)
+ * @param profileId - Voice profile ID (genz, speedrun, teacher, tedlasso)
  * @returns Audio buffer or error message
  */
 export async function synthesizeVoice(
@@ -218,7 +219,13 @@ export async function synthesizeVoice(
   try {
     // Get voice profile settings
     const profile = getVoiceProfile(profileId);
-    console.log(`[TTS-Gemini] Using voice: ${profile.voice} (${profile.name})`);
+
+    // Check for global language override
+    const { getGlobalVoiceLanguage } = await import("./global-settings");
+    const languageOverride = getGlobalVoiceLanguage();
+    const targetLanguage = languageOverride || profile.language;
+
+    console.log(`[TTS-Gemini] Using voice: ${profile.voice} (${profile.name}), language: ${targetLanguage}`);
 
     // Truncate if too long
     const truncatedText = text.length > TTS_MAX_CHARS
@@ -228,7 +235,7 @@ export async function synthesizeVoice(
     // STEP 1: Use Gemini LLM to rewrite Claude's output for conversational speech
     // This removes markdown, URLs, rewrites in conversational tone matching the profile
     // IMPORTANT: Limit output to ~800 chars for 1-minute voice message
-    const rewritePrompt = profile.systemPrompt + `\n\nRewrite this message for spoken audio (conversational, no URLs, no markdown).\n\nIMPORTANT: Keep your rewrite to approximately 800 characters maximum - this creates a 1-minute voice message. Be concise!\n\nMessage to rewrite:\n\n${truncatedText}`;
+    const rewritePrompt = profile.systemPrompt + `\n\nMessage to rewrite:\n\n${truncatedText}`;
 
     console.log(`[TTS-Gemini] Step 1: Rewriting text for speech...`);
 
@@ -269,11 +276,61 @@ export async function synthesizeVoice(
       return { error: "Gemini failed to rewrite text" };
     }
 
-    console.log(`[TTS-Gemini] Step 2: Generating audio from rewritten text...`);
     console.log(`[TTS-Gemini] Rewritten (${speechText.length} chars): ${speechText.slice(0, 100)}...`);
 
-    // STEP 2: Generate TTS audio from the rewritten text
-    const ttsPrompt = `Read this out loud: ${speechText}`;
+    // STEP 2: Translate if needed (if language is not en-US)
+    let finalSpeechText = speechText;
+    if (targetLanguage && targetLanguage !== "en-US") {
+      console.log(`[TTS-Gemini] Step 2a: Translating to ${targetLanguage}...`);
+
+      const translatePrompt = `Translate this text to ${targetLanguage}. Maintain the conversational tone and style. Keep it natural for spoken audio.\n\nText to translate:\n\n${speechText}`;
+
+      const translateResponse = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GOOGLE_TTS_API_KEY,
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{ text: translatePrompt }]
+            }]
+          }),
+        }
+      );
+
+      if (!translateResponse.ok) {
+        const errorText = await translateResponse.text();
+        console.error("[TTS-Gemini] Translation error:", translateResponse.status, errorText);
+        return { error: `Translation failed: ${translateResponse.status}` };
+      }
+
+      const translateData = await translateResponse.json() as {
+        candidates?: Array<{
+          content?: {
+            parts?: Array<{ text?: string }>
+          }
+        }>
+      };
+
+      const translatedText = translateData.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!translatedText) {
+        console.error("[TTS-Gemini] No translated text returned");
+        return { error: "Translation failed" };
+      }
+
+      finalSpeechText = translatedText;
+      console.log(`[TTS-Gemini] Translated (${finalSpeechText.length} chars): ${finalSpeechText.slice(0, 100)}...`);
+    }
+
+    console.log(`[TTS-Gemini] Step 3: Generating audio from text...`);
+
+    // STEP 3: Generate TTS audio from the rewritten (and possibly translated) text
+    // Use profile-specific TTS performance instructions for personality
+    const ttsPrompt = `${profile.ttsPrompt}\n\nText to speak:\n${finalSpeechText}`;
 
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent`,
@@ -330,7 +387,7 @@ export async function synthesizeVoice(
     }
 
     // Track usage for analytics (even though it's free)
-    trackTTSUsage(speechText.length);
+    trackTTSUsage(finalSpeechText.length);
 
     console.log(`[TTS-Gemini] ✅ Audio generated (${audioData.length} chars base64)`);
 

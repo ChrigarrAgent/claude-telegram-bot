@@ -52,6 +52,18 @@ export async function handleCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  // 2.6. Handle link_project callbacks: link_project:{project_name}
+  if (callbackData.startsWith("link_project:")) {
+    await handleLinkProjectCallback(ctx, callbackData);
+    return;
+  }
+
+  // 2.7. Handle voice_profile callbacks: voice_profile:{profile_id}
+  if (callbackData.startsWith("voice_profile:")) {
+    await handleVoiceProfileCallback(ctx, callbackData);
+    return;
+  }
+
   // 3. Handle safety confirmation callbacks: safety:{request_id}:allow|deny
   if (callbackData.startsWith("safety:")) {
     await handleSafetyCallback(ctx, callbackData);
@@ -145,7 +157,7 @@ export async function handleCallback(ctx: Context): Promise<void> {
   // Create streaming state
   const projectAlias = getProjectAlias(projectSession.workingDir);
   const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state, projectAlias);
+  const statusCallback = createStatusCallback(ctx, state, projectAlias, false, projectSession.workingDir);
 
   try {
     const response = await projectSession.sendMessage(
@@ -291,7 +303,7 @@ async function handleResumeCallback(
   const typing = startTypingIndicator(ctx);
   const projectAlias = getProjectAlias(projectSession.workingDir);
   const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state, projectAlias);
+  const statusCallback = createStatusCallback(ctx, state, projectAlias, false, projectSession.workingDir);
 
   try {
     await projectSession.sendMessage(
@@ -466,6 +478,121 @@ async function handleProjectCallback(
   }
 
   await ctx.answerCallbackQuery({ text: "Unknown action" });
+}
+
+/**
+ * Handle link_project callback: link_project:{project_name}
+ * Triggered when user selects a project to link from /link command in a group.
+ */
+async function handleLinkProjectCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
+  const groupTitle = ctx.chat?.title || "Unknown Group";
+
+  if (!userId || !chatId) {
+    await ctx.answerCallbackQuery({ text: "Invalid request" });
+    return;
+  }
+
+  // Verify this is a group
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (!isGroup) {
+    await ctx.answerCallbackQuery({ text: "Can only link groups", show_alert: true });
+    return;
+  }
+
+  // Parse callback data: link_project:{project_name}
+  const parts = callbackData.split(":");
+  if (parts.length !== 2) {
+    await ctx.answerCallbackQuery({ text: "Invalid callback data" });
+    return;
+  }
+
+  const projectAlias = parts[1]!.toLowerCase();
+  const projectPath = getProjectByAlias(projectAlias);
+
+  if (!projectPath) {
+    await ctx.answerCallbackQuery({
+      text: `Project "${projectAlias}" not found`,
+      show_alert: true
+    });
+    return;
+  }
+
+  // Check if already linked
+  const { getGroupLink } = await import("../group-links");
+  const existingLink = getGroupLink(chatId);
+
+  if (existingLink) {
+    // Group already linked - ask if they want to re-link
+    if (existingLink.projectName === projectAlias) {
+      await ctx.answerCallbackQuery({
+        text: "Already linked to this project",
+        show_alert: true
+      });
+      return;
+    }
+
+    // They're switching to a different project - auto-unlink first
+    const { removeGroupLink } = await import("../group-links");
+    removeGroupLink(chatId);
+  }
+
+  // Generate verification code (6-digit)
+  const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // Store pending link
+  sessionManager.setPendingGroupLink({
+    groupId: chatId,
+    groupTitle,
+    projectName: projectAlias,
+    projectPath,
+    verificationCode,
+    createdAt: new Date(),
+    requestedBy: userId,
+  });
+
+  console.log(`[LINK] Generated code ${verificationCode} for group ${chatId} → project ${projectAlias}`);
+
+  // Send verification code to user's DM
+  try {
+    await ctx.api.sendMessage(
+      userId,
+      `🔐 <b>Group Link Verification</b>\n\n` +
+      `You requested to link group <b>${groupTitle}</b> to project <code>${projectAlias}</code>.\n\n` +
+      `Verification code:\n` +
+      `<code>${verificationCode}</code>\n\n` +
+      `<b>Go back to the group and run:</b>\n` +
+      `<code>/verify ${verificationCode}</code>\n\n` +
+      `<i>Code expires in 10 minutes.</i>`,
+      { parse_mode: "HTML" }
+    );
+
+    // Update the original message
+    try {
+      await ctx.editMessageText(
+        `✅ <b>Verification code sent to your DM!</b>\n\n` +
+        `Use the command shown in your DM to complete the link.`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit link message:", error);
+    }
+
+    await ctx.answerCallbackQuery({ text: "Code sent to your DM!" });
+  } catch (error) {
+    console.error("Failed to send verification code:", error);
+    sessionManager.clearPendingGroupLink(chatId);
+
+    await ctx.answerCallbackQuery({
+      text: "Failed to send DM. Make sure you've started a private chat with the bot.",
+      show_alert: true
+    });
+  }
 }
 
 /**
@@ -676,6 +803,95 @@ async function handleAskUserQuestionCallback(
 }
 
 /**
+ * Handle voice_profile callbacks: voice_profile:{profile_id}
+ */
+async function handleVoiceProfileCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
+  if (!chatId) {
+    await ctx.answerCallbackQuery({ text: "Invalid chat" });
+    return;
+  }
+
+  // Parse callback data: voice_profile:{profile_id}
+  const parts = callbackData.split(":");
+  if (parts.length !== 2) {
+    await ctx.answerCallbackQuery({ text: "Invalid callback data" });
+    return;
+  }
+
+  const profileId = parts[1]!;
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+
+  // Get the profile
+  const { getVoiceProfile } = await import("../voice-profiles");
+  const { setVoiceProfile } = await import("../chat-settings");
+  const profile = getVoiceProfile(profileId);
+
+  // Check if profile exists (will return default if not found)
+  if (profile.id !== profileId) {
+    await ctx.answerCallbackQuery({
+      text: `Unknown profile: ${profileId}`,
+      show_alert: true
+    });
+    return;
+  }
+
+  // Set profile for this chat
+  if (isGroup) {
+    // Group: Set for this group only
+    setVoiceProfile(chatId, profileId);
+
+    // Update the message
+    try {
+      await ctx.editMessageText(
+        `✅ Voice profile switched to <b>${profile.name}</b>\n\n` +
+        `${profile.description}\n\n` +
+        `Voice: ${profile.voice}\n` +
+        `Language: ${profile.language}`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit voice profile message:", error);
+    }
+
+    await ctx.answerCallbackQuery({ text: `Switched to ${profile.name}` });
+  } else {
+    // DM: Set for DM + propagate to all linked groups
+    setVoiceProfile(chatId, profileId);
+
+    // Propagate to all linked groups
+    const { getAllGroupLinks } = await import("../group-links");
+    const allGroups = getAllGroupLinks();
+    let groupCount = 0;
+    for (const [groupId] of Array.from(allGroups)) {
+      setVoiceProfile(groupId, profileId);
+      groupCount++;
+    }
+
+    // Update the message
+    try {
+      await ctx.editMessageText(
+        `✅ Voice profile switched to <b>${profile.name}</b>\n\n` +
+        `${profile.description}\n\n` +
+        `Voice: ${profile.voice}\n` +
+        `Language: ${profile.language}\n\n` +
+        `Applied to DM and ${groupCount} linked group(s).\n\n` +
+        `<i>Groups can override individually.</i>`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit voice profile message:", error);
+    }
+
+    await ctx.answerCallbackQuery({ text: `Switched to ${profile.name} (applied to ${groupCount} groups)` });
+  }
+}
+
+/**
  * Send the user's response to Claude.
  */
 async function sendResponseToClaude(
@@ -703,7 +919,7 @@ async function sendResponseToClaude(
 
   // Create streaming state
   const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state, projectAlias);
+  const statusCallback = createStatusCallback(ctx, state, projectAlias, false, projectSession.workingDir);
 
   try {
     const response = await projectSession.sendMessage(

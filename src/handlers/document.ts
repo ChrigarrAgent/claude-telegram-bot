@@ -7,11 +7,14 @@
 
 import type { Context } from "grammy";
 import { basename, extname } from "path";
+import { statSync, unlinkSync } from "fs";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { auditLog, auditLogRateLimit } from "../utils";
 import { createMediaGroupBuffer } from "./media-group";
 import { getSessionOrReply, sendMessageWithRetry, handleMessageError } from "../helpers";
+import { saveFileToProject } from "../file-forwarder";
+import { createStatusCallback, StreamingState } from "./streaming";
 
 // Supported text file extensions
 const TEXT_EXTENSIONS = [
@@ -334,6 +337,101 @@ async function processArchive(
 }
 
 /**
+ * Process a raw document (no parsing, just save to disk).
+ */
+async function processRawDocument(
+  ctx: Context,
+  tempFilePath: string,
+  originalFileName: string,
+  caption: string | undefined,
+  userId: number,
+  username: string
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const projectDir = projectSession.workingDir;
+  const projectName = projectSession.projectName;
+  const stopProcessing = projectSession.session.startProcessing();
+
+  try {
+    // Save file to project directory
+    const savedPath = await saveFileToProject(
+      tempFilePath,
+      originalFileName,
+      projectDir,
+      "files"
+    );
+
+    // Extract user note (remove /raw or /file prefix)
+    const userNote = caption?.replace(/^\/(raw|file)\s*/i, "").trim() || "";
+
+    // Get file info
+    const stats = statSync(savedPath);
+    const relativePath = savedPath.replace(projectDir, ".");
+
+    // Build message for Claude
+    const message = `File forwarded from Telegram:
+
+📄 **File:** ${originalFileName}
+📍 **Path:** ${relativePath}
+📊 **Size:** ${(stats.size / 1024).toFixed(1)} KB
+${userNote ? `\n💬 **User note:** ${userNote}` : ""}
+
+The file has been saved to your working directory. You can read, process, or analyze it using Bash or Read tools.`;
+
+    // Show typing indicator
+    await ctx.replyWithChatAction("typing");
+
+    // Create streaming state
+    const state = new StreamingState();
+
+    // Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
+
+    // Create status callback with working directory for file sending
+    const statusCallback = createStatusCallback(ctx, state, projectName, voiceEnabled, projectSession.workingDir);
+
+    // Send to Claude
+    await projectSession.sendMessage(
+      message,
+      username,
+      userId,
+      statusCallback,
+      chatId,
+      ctx
+    );
+
+    projectSession.updateActivity();
+
+    // Audit log
+    await auditLog(
+      userId,
+      username,
+      "DOCUMENT_RAW",
+      `File: ${originalFileName}, Path: ${relativePath}, Note: ${userNote}`,
+      `(See conversation for Claude's response)`
+    );
+  } catch (error) {
+    console.error("Error in processRawDocument:", error);
+    await ctx.reply(
+      `❌ Failed to save file: ${error instanceof Error ? error.message : String(error)}`
+    );
+  } finally {
+    // Clean up temp file
+    try {
+      unlinkSync(tempFilePath);
+    } catch {}
+    stopProcessing();
+  }
+}
+
+/**
  * Process documents with Claude.
  */
 async function processDocuments(
@@ -490,6 +588,30 @@ export async function handleDocument(ctx: Context): Promise<void> {
   } catch (error) {
     console.error("Failed to download document:", error);
     await ctx.reply("❌ Failed to download document.");
+    return;
+  }
+
+  // 4.5. Check for raw mode (file forwarding without parsing)
+  const caption = ctx.message?.caption;
+  const isRawMode =
+    caption?.trim().toLowerCase().startsWith("/raw") ||
+    caption?.trim().toLowerCase().startsWith("/file");
+
+  if (isRawMode) {
+    console.log(`Received raw file: ${fileName} from @${username}`);
+
+    // Rate limit
+    const [allowed, retryAfter] = rateLimiter.check(userId);
+    if (!allowed) {
+      await auditLogRateLimit(userId, username, retryAfter!);
+      await ctx.reply(
+        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
+      );
+      return;
+    }
+
+    // Process as raw file (no parsing)
+    await processRawDocument(ctx, docPath, fileName, caption, userId, username);
     return;
   }
 

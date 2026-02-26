@@ -197,8 +197,80 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
-  // 1.2. Check for group link verification code (groups only)
+  // 1.2. Handle /verify command in text handler (workaround for grammY command routing issue)
   const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (isGroup && message.startsWith('/verify ')) {
+    console.log(`[TEXT-VERIFY] Handling /verify command in text handler`);
+
+    // Extract code from /verify command
+    const verifyMatch = message.match(/^\/verify\s+(\d{6})\s*$/);
+    if (verifyMatch) {
+      const code = verifyMatch[1]!;
+      const pendingLink = sessionManager.getPendingGroupLink(chatId);
+
+      console.log(`[VERIFY] Received code ${code} in group ${chatId} via /verify command`);
+      console.log(`[VERIFY] Pending link:`, pendingLink ? `exists for project ${pendingLink.projectName}` : 'not found');
+
+      if (pendingLink) {
+        console.log(`[VERIFY] Stored code: ${pendingLink.verificationCode}, received code: ${code}, match: ${pendingLink.verificationCode === code}`);
+      }
+
+      if (pendingLink && pendingLink.verificationCode === code) {
+        // Valid code - complete the link
+        console.log(`[VERIFY] ✅ Code match! Linking group ${chatId} to project ${pendingLink.projectName}`);
+
+        const { setGroupLink } = await import("../group-links");
+        setGroupLink(chatId, {
+          projectName: pendingLink.projectName,
+          projectPath: pendingLink.projectPath,
+          linkedAt: new Date().toISOString(),
+          linkedBy: userId,
+          groupTitle: ctx.chat?.title || "Unknown Group",
+        });
+
+        // Clear pending link
+        sessionManager.clearPendingGroupLink(chatId);
+
+        // Set this group as the last-used project for this chat
+        sessionManager.setLastUsed(chatId, pendingLink.projectName);
+
+        console.log(`[VERIFY] ✅ Link complete! Group ${chatId} → ${pendingLink.projectName}`);
+
+        await ctx.reply(
+          `✅ <b>Group successfully linked!</b>\n\n` +
+          `Project: <code>${pendingLink.projectName}</code>\n\n` +
+          `You can now send messages and files to Claude in this group.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else if (pendingLink) {
+        // Invalid code
+        await ctx.reply(
+          `❌ Invalid verification code.\n\n` +
+          `The code in your DM is different. Please check and try again.\n\n` +
+          `<i>Use /link again if the code expired.</i>`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else {
+        // No pending link
+        await ctx.reply(
+          `⚠️ No pending link verification for this group.\n\n` +
+          `Use <code>/link &lt;project-name&gt;</code> to start the linking process.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+    } else {
+      await ctx.reply(
+        "❌ Invalid format. Usage: <code>/verify 123456</code>",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+  }
+
+  // 1.3. Check for group link verification code (groups only) - legacy 6-digit code only
   if (isGroup) {
     // Check if this is a verification code (6 digits)
     const codeMatch = message.match(/^\s*(\d{6})\s*$/);
@@ -206,8 +278,17 @@ export async function handleText(ctx: Context): Promise<void> {
       const code = codeMatch[1]!;
       const pendingLink = sessionManager.getPendingGroupLink(chatId);
 
+      console.log(`[VERIFY] Received code ${code} in group ${chatId}`);
+      console.log(`[VERIFY] Pending link:`, pendingLink ? `exists for project ${pendingLink.projectName}` : 'not found');
+
+      if (pendingLink) {
+        console.log(`[VERIFY] Stored code: ${pendingLink.verificationCode}, received code: ${code}, match: ${pendingLink.verificationCode === code}`);
+      }
+
       if (pendingLink && pendingLink.verificationCode === code) {
         // Valid code - complete the link
+        console.log(`[VERIFY] ✅ Code match! Linking group ${chatId} to project ${pendingLink.projectName}`);
+
         const { setGroupLink } = await import("../group-links");
         setGroupLink(chatId, {
           projectName: pendingLink.projectName,
@@ -223,8 +304,11 @@ export async function handleText(ctx: Context): Promise<void> {
         // Set this group as the last-used project for this chat
         sessionManager.setLastUsed(chatId, pendingLink.projectName);
 
+        console.log(`[VERIFY] ✅ Link complete! Group ${chatId} → ${pendingLink.projectName}`);
+
         await ctx.reply(
-          `✅ Group successfully linked to project <code>${pendingLink.projectName}</code>!\n\n` +
+          `✅ <b>Group successfully linked!</b>\n\n` +
+          `Project: <code>${pendingLink.projectName}</code>\n\n` +
           `You can now send messages and files to Claude in this group.`,
           { parse_mode: "HTML" }
         );

@@ -42,6 +42,18 @@ export interface TokenUsage {
   cache_creation_input_tokens?: number;
 }
 
+// Model usage with context window info (from SDK result event)
+export interface ModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  webSearchRequests: number;
+  costUSD: number;
+  contextWindow: number; // Total context window size
+  maxOutputTokens: number; // Max output tokens per response
+}
+
 // MCP server configuration types
 export type McpServerConfig = McpStdioConfig | McpHttpConfig;
 

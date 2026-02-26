@@ -33,6 +33,10 @@ export class ProcessMonitor {
   private notifiedStartIds = new Set<string>();
   private completionCallback: CompletionCallback | null = null;
   private startCallback: StartCallback | null = null;
+  private taskNotificationMessages = new Map<
+    string,
+    { chatId: number; messageId: number }
+  >(); // processId → notification message
 
   /**
    * Start monitoring for process completions and new process starts.
@@ -64,6 +68,28 @@ export class ProcessMonitor {
   getRunningProcesses(): LongRunStatus[] {
     const statuses = this.readAllStatuses();
     return statuses.filter((s) => s.status === "running" || s.status === "starting");
+  }
+
+  /**
+   * Store a notification message ID for a process.
+   * Used to update/delete the message when the process completes.
+   */
+  setNotificationMessage(processId: string, chatId: number, messageId: number): void {
+    this.taskNotificationMessages.set(processId, { chatId, messageId });
+  }
+
+  /**
+   * Get the notification message ID for a process, if one was stored.
+   */
+  getNotificationMessage(processId: string): { chatId: number; messageId: number } | undefined {
+    return this.taskNotificationMessages.get(processId);
+  }
+
+  /**
+   * Remove a notification message tracking entry.
+   */
+  clearNotificationMessage(processId: string): void {
+    this.taskNotificationMessages.delete(processId);
   }
 
   /**

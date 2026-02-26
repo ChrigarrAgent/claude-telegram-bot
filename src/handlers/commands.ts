@@ -34,23 +34,13 @@ export async function handleStart(ctx: Context): Promise<void> {
       `Status: ${status}\n` +
       `Project: <b>${projectAlias}</b>\n` +
       `Directory: <code>${workDir}</code>\n\n` +
-      `<b>Session Commands:</b>\n` +
+      `<b>Quick Start:</b>\n` +
+      `/help - Complete guide to all features\n` +
+      `/projects - Switch between projects\n` +
       `/new - Start fresh session\n` +
-      `/stop - Stop current query\n` +
       `/status - Show detailed status\n` +
-      `/usage - Show token usage &amp; costs\n` +
-      `/resume - Resume saved session\n` +
-      `/retry - Retry last message\n` +
-      `/voice - Toggle voice responses\n` +
-      `/restart - Restart the bot\n\n` +
-      `<b>Project Commands:</b>\n` +
-      `/projects - List all available projects\n` +
-      `/project &lt;name&gt; - Switch to project\n` +
-      `  • If project doesn't exist, offers to create or clone from GitHub\n\n` +
-      `<b>SSH Handoff:</b>\n` +
-      `/handoff - Get SSH takeover command\n` +
-      `/tmux - Shared tmux session info\n\n` +
-      `<b>Message Features:</b>\n` +
+      `/voice - Toggle voice responses\n\n` +
+      `<b>Message Types:</b>\n` +
       `• 📝 Text messages - Chat with Claude\n` +
       `• 🎤 Voice messages - Transcribed and processed\n` +
       `• 📷 Photos - Image analysis\n` +
@@ -59,7 +49,8 @@ export async function handleStart(ctx: Context): Promise<void> {
       `• ↪️ Forward context - Forward messages to analyze them\n\n` +
       `<b>Tips:</b>\n` +
       `• Prefix with <code>!</code> to interrupt current query\n` +
-      `• Use "think" keyword for extended reasoning`,
+      `• Use "think" keyword for extended reasoning\n` +
+      `• Type <code>/help</code> for complete documentation`,
     { parse_mode: "HTML" }
   );
 }
@@ -929,6 +920,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
       `<code>/voice off</code> - Disable voice responses\n` +
       `<code>/voice profiles</code> - List voice profiles\n` +
       `<code>/voice profile &lt;id&gt;</code> - Switch profile\n` +
+      `<code>/voice language [code]</code> - Set/view language\n` +
       `<code>/voice status</code> - Check TTS usage stats\n` +
       (isGroup ? `<code>/voice clear</code> - Reset to default\n\n` : '\n') +
       (isGroup
@@ -947,30 +939,44 @@ export async function handleVoice(ctx: Context): Promise<void> {
     const currentProfileId = getVoiceProfile(chatId);
     const profiles = getAllVoiceProfiles();
 
-    const lines: string[] = [
-      `🎙️ <b>Available Voice Profiles</b>\n`,
-    ];
+    // Create inline keyboard buttons (2 per row)
+    const buttons: { text: string; callback_data: string }[][] = [];
 
-    for (const profile of profiles) {
-      const isCurrent = profile.id === currentProfileId;
-      const marker = isCurrent ? " ←" : "";
-      const promptPreview = profile.systemPrompt.split('\n')[0];
+    for (let i = 0; i < profiles.length; i += 2) {
+      const row: { text: string; callback_data: string }[] = [];
 
-      lines.push(
-        `${isCurrent ? '▶️' : '  '} <code>${profile.id}</code> - <b>${profile.name}</b>${marker}\n` +
-        `   ${profile.description}\n` +
-        `   Voice: <b>${profile.voice}</b>\n` +
-        `   <i>${promptPreview}</i>\n`
-      );
+      // First button in row
+      const profile1 = profiles[i]!;
+      const isCurrent1 = profile1.id === currentProfileId;
+      row.push({
+        text: isCurrent1 ? `▶️ ${profile1.name}` : profile1.name,
+        callback_data: `voice_profile:${profile1.id}`,
+      });
+
+      // Second button in row (if exists)
+      if (profiles[i + 1]) {
+        const profile2 = profiles[i + 1]!;
+        const isCurrent2 = profile2.id === currentProfileId;
+        row.push({
+          text: isCurrent2 ? `▶️ ${profile2.name}` : profile2.name,
+          callback_data: `voice_profile:${profile2.id}`,
+        });
+      }
+
+      buttons.push(row);
     }
 
-    lines.push(
-      `\n<b>Switch profile:</b>\n` +
-      `<code>/voice profile &lt;id&gt;</code>\n\n` +
-      `Example: <code>/voice profile genz</code>`
+    await ctx.reply(
+      `🎙️ <b>Available Voice Profiles</b>\n\n` +
+      `Current: <b>${profiles.find(p => p.id === currentProfileId)?.name}</b>\n\n` +
+      `Select a profile to switch:`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: buttons,
+        },
+      }
     );
-
-    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
     return;
   }
 
@@ -1004,13 +1010,87 @@ export async function handleVoice(ctx: Context): Promise<void> {
     }
 
     // Set profile for this chat
-    setVoiceProfile(chatId, profileId);
+    if (isGroup) {
+      // Group: Set for this group only
+      setVoiceProfile(chatId, profileId);
+
+      await ctx.reply(
+        `✅ Voice profile switched to <b>${profile.name}</b>\n\n` +
+        `${profile.description}\n\n` +
+        `Voice: ${profile.voice}\n\n` +
+        `<i>${profile.systemPrompt.split('\n')[0]}</i>`,
+        { parse_mode: "HTML" }
+      );
+    } else {
+      // DM: Set for DM + propagate to all linked groups
+      setVoiceProfile(chatId, profileId);
+
+      // Propagate to all linked groups
+      const allGroups = getAllGroupLinks();
+      let groupCount = 0;
+      for (const [groupId] of Array.from(allGroups)) {
+        setVoiceProfile(groupId, profileId);
+        groupCount++;
+      }
+
+      await ctx.reply(
+        `✅ Voice profile switched to <b>${profile.name}</b>\n\n` +
+        `${profile.description}\n\n` +
+        `Voice: ${profile.voice}\n\n` +
+        `<i>${profile.systemPrompt.split('\n')[0]}</i>\n\n` +
+        `Applied to DM and ${groupCount} linked group(s).\n\n` +
+        `<i>Groups can still override individually with /voice profile.</i>`,
+        { parse_mode: "HTML" }
+      );
+    }
+    return;
+  }
+
+  // Handle language setting (global bot setting)
+  if (command === 'language') {
+    const languageCode = args[1]?.toLowerCase();
+
+    if (!languageCode) {
+      // Show current language
+      const { getGlobalVoiceLanguage } = await import("../global-settings");
+      const languageOverride = getGlobalVoiceLanguage();
+      const currentLanguage = languageOverride || "en-US";
+
+      await ctx.reply(
+        `🌍 <b>Voice Language (Global)</b>\n\n` +
+        `Current: <b>${currentLanguage}</b> ${languageOverride ? '(custom)' : '(default)'}\n\n` +
+        `<b>Usage:</b>\n` +
+        `<code>/voice language en-US</code> - English (US)\n` +
+        `<code>/voice language de-DE</code> - German\n` +
+        `<code>/voice language es-ES</code> - Spanish\n` +
+        `<code>/voice language fr-FR</code> - French\n` +
+        `<code>/voice language clear</code> - Reset to default\n\n` +
+        `<i>⚙️ This is a bot-wide setting that applies to ALL chats (DMs and groups).</i>`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // Handle clear
+    if (languageCode === 'clear') {
+      const { clearGlobalVoiceLanguage } = await import("../global-settings");
+      clearGlobalVoiceLanguage();
+
+      await ctx.reply(
+        `✅ Language reset to default: <b>en-US</b>\n\n` +
+        `<i>This applies to all chats.</i>`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // Set language override
+    const { setGlobalVoiceLanguage } = await import("../global-settings");
+    setGlobalVoiceLanguage(languageCode);
 
     await ctx.reply(
-      `✅ Voice profile switched to <b>${profile.name}</b>\n\n` +
-      `${profile.description}\n\n` +
-      `Voice: ${profile.voice}\n\n` +
-      `<i>${profile.systemPrompt.split('\n')[0]}</i>`,
+      `✅ Voice language set to <b>${languageCode}</b>\n\n` +
+      `<i>⚙️ This applies to ALL chats (DMs and groups).</i>`,
       { parse_mode: "HTML" }
     );
     return;
@@ -1080,6 +1160,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
       `<code>/voice off</code>\n` +
       `<code>/voice profiles</code>\n` +
       `<code>/voice profile &lt;id&gt;</code>\n` +
+      `<code>/voice language [code]</code>\n` +
       `<code>/voice status</code>\n` +
       (isGroup ? `<code>/voice clear</code>\n` : '') +
       `<code>/voice override</code> (if disabled)`,
@@ -1149,12 +1230,44 @@ export async function handleLink(ctx: Context): Promise<void> {
   // Parse project name from command
   const args = ctx.message?.text?.split(/\s+/).slice(1);
   if (!args || args.length === 0) {
-    await ctx.reply(
-      "❌ Please specify a project name.\n\n" +
-      "Usage: <code>/link &lt;project-name&gt;</code>\n\n" +
-      "Example: <code>/link exmas-commuter</code>",
-      { parse_mode: "HTML" }
-    );
+    // No project specified - show inline buttons like /projects
+    const { getGroupLink } = await import("../group-links");
+    const existingLink = getGroupLink(chatId);
+
+    // Get all available projects
+    const aliasMap = getAliasToPathMap();
+    const projectButtons = Object.entries(aliasMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([alias]) => [
+        {
+          text: alias,
+          callback_data: `link_project:${alias}`,
+        },
+      ]);
+
+    if (projectButtons.length === 0) {
+      await ctx.reply(
+        "❌ No projects found.\n\n" +
+        "Create a project folder first, then use <code>/link &lt;project-name&gt;</code>",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    let message = "🔗 <b>Link Group to Project</b>\n\n";
+    if (existingLink) {
+      message += `Currently linked to: <code>${existingLink.projectName}</code>\n\n`;
+      message += "Select a different project to link:\n";
+    } else {
+      message += "Select a project to link this group to:\n";
+    }
+
+    await ctx.reply(message, {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: projectButtons,
+      },
+    });
     return;
   }
 
@@ -1197,20 +1310,24 @@ export async function handleLink(ctx: Context): Promise<void> {
   });
 
   // Send verification code to user's DM
+  console.log(`[LINK] Generated code ${verificationCode} for group ${chatId} → project ${projectAlias}`);
+
   try {
     await ctx.api.sendMessage(
       userId,
-      `🔐 Group Link Verification\n\n` +
+      `🔐 <b>Group Link Verification</b>\n\n` +
       `You requested to link group <b>${groupTitle}</b> to project <code>${projectAlias}</code>.\n\n` +
-      `Verification code: <code>${verificationCode}</code>\n\n` +
-      `Go back to the group and send this code to complete the link.\n\n` +
+      `Verification code:\n` +
+      `<code>${verificationCode}</code>\n\n` +
+      `<b>Go back to the group and run:</b>\n` +
+      `<code>/verify ${verificationCode}</code>\n\n` +
       `<i>Code expires in 10 minutes.</i>`,
       { parse_mode: "HTML" }
     );
 
     await ctx.reply(
-      `📬 Verification code sent to your DM.\n\n` +
-      `Check your private chat with the bot and paste the code here to complete the link.`,
+      `✅ <b>Verification code sent to your DM!</b>\n\n` +
+      `Use the command shown in your DM to complete the link.`,
       { parse_mode: "HTML" }
     );
   } catch (error) {
@@ -1219,6 +1336,112 @@ export async function handleLink(ctx: Context): Promise<void> {
     await ctx.reply(
       `❌ Failed to send verification code to your DM.\n\n` +
       `Make sure you've started a private chat with the bot first (send /start in DM).`
+    );
+  }
+}
+
+/**
+ * /verify <code> - Verify group link with 6-digit code.
+ */
+export async function handleVerify(ctx: Context): Promise<void> {
+  console.log(`[VERIFY-CMD] handleVerify called! chatId=${ctx.chat?.id}`);
+
+  const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
+
+  if (!userId || !chatId) {
+    return;
+  }
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    return;
+  }
+
+  // Only works in groups
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (!isGroup) {
+    await ctx.reply(
+      "⚠️ The <code>/verify</code> command only works in group chats.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Parse verification code from command
+  const args = ctx.message?.text?.split(/\s+/).slice(1);
+  if (!args || args.length === 0) {
+    await ctx.reply(
+      "❌ Please provide the 6-digit verification code.\n\n" +
+      "Usage: <code>/verify 123456</code>",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const code = args[0]!.trim();
+
+  // Validate it's 6 digits
+  if (!/^\d{6}$/.test(code)) {
+    await ctx.reply(
+      "❌ Invalid format. Code must be exactly 6 digits.\n\n" +
+      "Example: <code>/verify 123456</code>",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const pendingLink = sessionManager.getPendingGroupLink(chatId);
+
+  console.log(`[VERIFY] Received code ${code} in group ${chatId} via /verify command`);
+  console.log(`[VERIFY] Pending link:`, pendingLink ? `exists for project ${pendingLink.projectName}` : 'not found');
+
+  if (pendingLink) {
+    console.log(`[VERIFY] Stored code: ${pendingLink.verificationCode}, received code: ${code}, match: ${pendingLink.verificationCode === code}`);
+  }
+
+  if (pendingLink && pendingLink.verificationCode === code) {
+    // Valid code - complete the link
+    console.log(`[VERIFY] ✅ Code match! Linking group ${chatId} to project ${pendingLink.projectName}`);
+
+    const { setGroupLink } = await import("../group-links");
+    setGroupLink(chatId, {
+      projectName: pendingLink.projectName,
+      projectPath: pendingLink.projectPath,
+      linkedAt: new Date().toISOString(),
+      linkedBy: userId,
+      groupTitle: ctx.chat?.title || "Unknown Group",
+    });
+
+    // Clear pending link
+    sessionManager.clearPendingGroupLink(chatId);
+
+    // Set this group as the last-used project for this chat
+    sessionManager.setLastUsed(chatId, pendingLink.projectName);
+
+    console.log(`[VERIFY] ✅ Link complete! Group ${chatId} → ${pendingLink.projectName}`);
+
+    await ctx.reply(
+      `✅ <b>Group successfully linked!</b>\n\n` +
+      `Project: <code>${pendingLink.projectName}</code>\n\n` +
+      `You can now send messages and files to Claude in this group.`,
+      { parse_mode: "HTML" }
+    );
+  } else if (pendingLink) {
+    // Invalid code
+    await ctx.reply(
+      `❌ Invalid verification code.\n\n` +
+      `The code in your DM is different. Please check and try again.\n\n` +
+      `<i>Use /link again if the code expired.</i>`,
+      { parse_mode: "HTML" }
+    );
+  } else {
+    // No pending link
+    await ctx.reply(
+      `⚠️ No pending link verification for this group.\n\n` +
+      `Use <code>/link &lt;project-name&gt;</code> to start the linking process.`,
+      { parse_mode: "HTML" }
     );
   }
 }
@@ -1270,4 +1493,165 @@ export async function handleUnlink(ctx: Context): Promise<void> {
     `✅ Group unlinked from project <code>${link.projectName}</code>.`,
     { parse_mode: "HTML" }
   );
+}
+
+/**
+ * /help - Show comprehensive help about bot features and commands.
+ */
+export async function handleHelp(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized. Contact the bot owner for access.");
+    return;
+  }
+
+  const helpText = `
+🤖 <b>Claude Telegram Bot - Complete Guide</b>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>💬 HOW TO INTERACT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>Text Messages</b>
+• Just send a message to chat with Claude
+• Prefix with <code>!</code> to interrupt current query
+• Use "think" keyword for extended reasoning
+
+<b>Voice Messages</b>
+• Send voice → auto-transcribed → processed
+• Enable voice responses with <code>/voice on</code>
+
+<b>Photos</b>
+• Send photos for image analysis
+• Albums are grouped automatically
+
+<b>Documents</b>
+• PDFs: Automatically extracted
+• Text files: Parsed and sent to Claude
+• <code>/raw filename</code> or <code>/file filename</code> as caption:
+  → Saves to project without parsing
+  → Claude can read/process manually
+
+<b>Context Features</b>
+• ↩️ Reply to a message to include it
+• ↪️ Forward messages to analyze them
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>📁 PROJECT MANAGEMENT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>Commands:</b>
+<code>/projects</code> - List all projects (buttons)
+<code>/project &lt;name&gt;</code> - Switch to project
+<code>/project &lt;name&gt; &lt;prompt&gt;</code> - Switch and send prompt
+<code>/project /path</code> - Use custom path
+
+<b>Multi-Project Syntax:</b>
+<code>@projectname your message</code>
+Routes message to specific project without switching
+
+<b>Example:</b>
+<code>@mysite check server status</code>
+<code>@api-backend run tests</code>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>🎮 SESSION COMMANDS</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<code>/new</code> - Start fresh session
+<code>/stop</code> - Stop current query
+<code>/status</code> - Show detailed status
+<code>/resume</code> - List and resume saved sessions
+<code>/retry</code> - Retry last message
+<code>/restart</code> - Restart the bot
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>🔊 VOICE RESPONSES</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<code>/voice</code> - Show current status
+<code>/voice on</code> - Enable voice responses
+<code>/voice off</code> - Disable voice responses
+<code>/voice profiles</code> - List voice profiles
+<code>/voice profile &lt;id&gt;</code> - Switch profile
+<code>/voice language &lt;code&gt;</code> - Set language
+<code>/voice status</code> - Check TTS usage stats
+
+<b>Available Profiles:</b>
+• default - Professional assistant
+• genz - Casual Gen Z style
+• pirate - Pirate speak
+• robot - Robotic monotone
+• storyteller - Narrative style
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>👥 GROUP CHAT FEATURES</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<code>/link &lt;project&gt;</code> - Link group to project
+<code>/verify &lt;code&gt;</code> - Verify link (6-digit code)
+<code>/unlink</code> - Unlink group from project
+
+<b>How it works:</b>
+1. In group: <code>/link myproject</code>
+2. Bot sends code to your DM
+3. In group: <code>/verify 123456</code>
+4. Group now routes to that project
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>🖥️ SSH HANDOFF</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<code>/handoff</code> - Get session takeover info
+<code>/tmux</code> - Shared tmux session details
+
+<b>Workflow:</b>
+1. Start conversation in Telegram
+2. Run <code>/handoff</code>
+3. SSH to server, run <code>cr</code>
+4. Continue in terminal
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>⚙️ ADVANCED FEATURES</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>Token Usage:</b>
+<code>/usage</code> - View token stats, costs, rate limits
+
+<b>Long-Running Tasks:</b>
+Claude automatically detects long tasks and runs them in background:
+• You get notified when complete
+• Auto-resumes to analyze results
+• Examples: simulations, test suites, builds
+
+<b>Large Responses:</b>
+Responses >3,500 chars are saved as files:
+• Summary shown in chat
+• Full markdown file sent for download
+• Stored in <code>.claude-bot/responses/</code>
+
+<b>File Management:</b>
+• Raw files: <code>.claude-bot/files/</code>
+• Auto-cleanup after 7 days (configurable)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>🎯 PRO TIPS</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• Work on multiple projects concurrently
+• Use <code>@project</code> syntax for parallel tasks
+• Voice messages work great for quick queries
+• Forward code snippets for analysis
+• Reply to old messages for context
+• Use <code>!</code> prefix to interrupt long queries
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>Need help with a specific feature?</b>
+Try: <code>/start</code> for quick reference
+Or: <code>/status</code> for current state
+`;
+
+  await ctx.reply(helpText, { parse_mode: "HTML" });
 }

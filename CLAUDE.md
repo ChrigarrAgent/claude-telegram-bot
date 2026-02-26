@@ -184,6 +184,75 @@ The bot supports multiple concurrent projects with session isolation:
 - `/project <name>` - Switches to project (creates if doesn't exist)
 - `@projectname message` - Routes message to specific project
 
+## File Forwarding Feature
+
+The bot supports "raw file forwarding" for files that don't need parsing or exceed Telegram's display capabilities.
+
+### Sending Raw Files
+
+Send any file with a caption starting with `/raw` or `/file`:
+
+```
+/raw analyze this sales data
+```
+
+**What happens:**
+1. Bot saves file to `{project}/.claude-bot/files/{timestamp}_{filename}`
+2. Sends file path to Claude (no content extraction)
+3. Claude can read/process using Bash or Read tools
+
+**Use cases:**
+- Large JSON/CSV datasets
+- Binary files (images, PDFs as-is, executables)
+- Archives you want Claude to extract manually
+- Any file type not supported by default parsing
+
+### Large Response Handling
+
+When Claude's response exceeds 3,500 characters:
+1. Full response saved to `{project}/.claude-bot/responses/{timestamp}_response.md`
+2. Intelligent summary sent via Telegram (not just first 500 chars)
+3. Full markdown file uploaded as Telegram document for download
+4. File path provided for local reading
+5. Voice mode receives full text for intelligent summarization
+
+**Configuration:**
+- `RESPONSE_SIZE_THRESHOLD` - Character limit before saving (default: 3500)
+- `AUTO_SAVE_LARGE_RESPONSES` - Enable/disable feature (default: true)
+
+### File Cleanup
+
+**Automatic cleanup:**
+- Runs daily (configurable via `CLEANUP_INTERVAL_MS`)
+- Deletes files older than `FILE_RETENTION_DAYS` (default: 7 days)
+- Affects both `.claude-bot/files/` and `.claude-bot/responses/`
+
+**Manual cleanup:**
+Claude can delete files anytime using Bash:
+```bash
+rm -rf .claude-bot/files/*
+rm -rf .claude-bot/responses/*
+```
+
+**Configuration options:**
+```bash
+FILE_RETENTION_DAYS=7          # Keep files for 7 days
+FILE_RETENTION_DAYS=30         # Keep files for 30 days
+FILE_RETENTION_DAYS=0          # Disable auto-cleanup
+RAW_FILE_MAX_SIZE=52428800     # 50MB max file size
+```
+
+### Security
+
+**Path validation:**
+- Files only saved to project directories within `ALLOWED_PATHS`
+- Directory traversal attacks blocked
+- Filenames sanitized (special chars removed)
+
+**Size limits:**
+- Raw files: 50MB default (configurable)
+- Response files: Unlimited (depends on available disk space)
+
 ## Known Issues & Solutions
 
 ### Issue: SDK fails silently with non-existent cwd

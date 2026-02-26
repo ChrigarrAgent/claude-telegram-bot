@@ -6,10 +6,23 @@
 
 import { Bot } from "grammy";
 import { run, sequentialize } from "@grammyjs/runner";
-import { TELEGRAM_TOKEN, WORKING_DIR, ALLOWED_USERS, RESTART_FILE, ACTIVE_SESSIONS_FILE, HEARTBEAT_FILE } from "./config";
+import {
+  TELEGRAM_TOKEN,
+  WORKING_DIR,
+  ALLOWED_USERS,
+  RESTART_FILE,
+  ACTIVE_SESSIONS_FILE,
+  HEARTBEAT_FILE,
+  FILE_RETENTION_DAYS,
+  CLEANUP_INTERVAL_MS,
+} from "./config";
 import type { ActiveSessionsData, HeartbeatData, ActiveSessionEntry } from "./types";
 import { sessionManager } from "./session-manager";
 import { unlinkSync, readFileSync, existsSync } from "fs";
+
+// Track task IDs that are currently in a retry loop to prevent duplicate retries
+const pendingCompletionRetries = new Set<string>();
+import { cleanupOldFiles } from "./file-forwarder";
 import { acquireLock, releaseLock, setupLockCleanup } from "./process-lock";
 import {
   handleStart,
@@ -26,7 +39,9 @@ import {
   handleUsage,
   handleVoiceCommand,
   handleLink,
+  handleVerify,
   handleUnlink,
+  handleHelp,
   handleText,
   handleVoice,
   handlePhoto,
@@ -62,7 +77,14 @@ async function autoContinueSession(
     const voiceEnabled = getVoiceMode(chatId);
 
     // Use consolidated status callback (same pattern as normal message flow)
-    const statusCallback = createBotApiStatusCallback(bot.api, chatId, projectAlias, voiceEnabled);
+    const statusCallback = createBotApiStatusCallback(
+      bot.api,
+      chatId,
+      projectAlias,
+      voiceEnabled,
+      projectSession.projectName,
+      projectSession.workingDir
+    );
 
     // Send the continue message to Claude
     // IMPORTANT: Explicitly tell Claude NOT to restart the bot again.
@@ -135,13 +157,15 @@ async function handleProcessStart(status: LongRunStatus): Promise<void> {
 
     for (const chatId of chatIds) {
       try {
-        await bot.api.sendMessage(
+        const msg = await bot.api.sendMessage(
           chatId,
           `<b>${projectAlias}:</b> ⏳ Long-running task started\n` +
             `<code>${command}</code>\n\n` +
             `You will be notified when it completes.`,
           { parse_mode: "HTML" }
         );
+        // Store message ID so we can update it when the task completes
+        processMonitor.setNotificationMessage(status.id, chatId, msg.message_id);
       } catch (e) {
         console.error(`ProcessMonitor: Failed to notify chat ${chatId} about start:`, e);
       }
@@ -205,27 +229,62 @@ async function handleProcessCompletion(status: LongRunStatus): Promise<void> {
       return;
     }
 
-    // If session is busy, retry after 10 seconds
+    // If session is busy, retry after 10 seconds (but only if not already retrying)
     if (projectSession.isRunning()) {
-      console.log(
-        `ProcessMonitor: Session ${matchedAlias} is busy, retrying in 10s`
-      );
-      setTimeout(() => handleProcessCompletion(status), 10_000);
+      if (!pendingCompletionRetries.has(status.id)) {
+        pendingCompletionRetries.add(status.id);
+        console.log(
+          `ProcessMonitor: Session ${matchedAlias} is busy, will retry in 10s (task ${status.id})`
+        );
+        setTimeout(() => {
+          pendingCompletionRetries.delete(status.id);
+          handleProcessCompletion(status);
+        }, 10_000);
+      }
       return;
     }
 
     const exitLabel = status.exit_code === 0 ? "successfully" : `with exit code ${status.exit_code}`;
     const projectAlias = getProjectAlias(projectSession.workingDir);
 
-    // Notify all chats for this project
+    // Update notification messages for this task
     for (const chatId of chatIds) {
       try {
-        await bot.api.sendMessage(
-          chatId,
-          `<b>${projectAlias}:</b> Background process completed ${exitLabel}.\n` +
-            `<code>${status.command.trim()}</code>`,
-          { parse_mode: "HTML" }
-        );
+        const notificationMsg = processMonitor.getNotificationMessage(status.id);
+
+        // Clean up command for display
+        const command = status.command.replace(/\n/g, " ").trim();
+
+        // Determine emoji based on exit code
+        const emoji = status.exit_code === 0 ? "✅" : "❌";
+        const statusText = status.exit_code === 0 ? "completed successfully" : `terminated (exit code ${status.exit_code})`;
+
+        const messageText =
+          `<b>${projectAlias}:</b> ${emoji} Long-running task ${statusText}\n` +
+          `<code>${command}</code>`;
+
+        if (notificationMsg && notificationMsg.chatId === chatId) {
+          // Update the existing "task started" message
+          try {
+            await bot.api.editMessageText(
+              chatId,
+              notificationMsg.messageId,
+              messageText,
+              { parse_mode: "HTML" }
+            );
+          } catch (editError: any) {
+            // If edit fails (message too old/deleted), send new message
+            if (editError?.description?.includes("message to edit not found") ||
+                editError?.description?.includes("message can't be edited")) {
+              await bot.api.sendMessage(chatId, messageText, { parse_mode: "HTML" });
+            } else {
+              throw editError;
+            }
+          }
+        } else {
+          // No stored message (backward compatibility or message from before restart)
+          await bot.api.sendMessage(chatId, messageText, { parse_mode: "HTML" });
+        }
       } catch (e) {
         console.error(
           `ProcessMonitor: Failed to notify chat ${chatId}:`,
@@ -233,6 +292,9 @@ async function handleProcessCompletion(status: LongRunStatus): Promise<void> {
         );
       }
     }
+
+    // Clean up the stored notification message
+    processMonitor.clearNotificationMessage(status.id);
 
     // Send synthetic message to Claude to read the log and continue
     const primaryChatId = chatIds[0]!;
@@ -242,7 +304,14 @@ async function handleProcessCompletion(status: LongRunStatus): Promise<void> {
     const voiceEnabled = getVoiceMode(primaryChatId);
 
     // Use consolidated status callback (same pattern as normal message flow)
-    const statusCallback = createBotApiStatusCallback(bot.api, primaryChatId, projectAlias, voiceEnabled);
+    const statusCallback = createBotApiStatusCallback(
+      bot.api,
+      primaryChatId,
+      projectAlias,
+      voiceEnabled,
+      projectSession.projectName,
+      projectSession.workingDir
+    );
 
     const logFile = `/tmp/long-run/${status.id}.log`;
     const prompt =
@@ -353,6 +422,7 @@ bot.use(
 // ============== Command Handlers ==============
 
 bot.command("start", handleStart);
+bot.command("help", handleHelp);
 bot.command("new", handleNew);
 bot.command("stop", handleStop);
 bot.command("status", handleStatus);
@@ -366,6 +436,8 @@ bot.command("projects", handleProjects);
 bot.command("usage", handleUsage);
 bot.command("voice", handleVoiceCommand);
 bot.command("link", handleLink);
+bot.command("verify", handleVerify);
+console.log("[STARTUP] ✓ /verify command registered");
 bot.command("unlink", handleUnlink);
 
 // ============== Message Handlers ==============
@@ -604,6 +676,7 @@ if (existsSync(ACTIVE_SESSIONS_FILE) && crashedSessions.length === 0) {
 // This allows different projects to process messages in parallel,
 // while sequentialize ensures same-project messages are serial
 let runner: ReturnType<typeof run> | null = null;
+let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 try {
   console.log("Starting concurrent polling with @grammyjs/runner...");
@@ -618,6 +691,55 @@ try {
 
   // Start monitoring for long-running process completions
   processMonitor.start(handleProcessCompletion, handleProcessStart);
+
+  // Start file cleanup scheduler
+  async function runFileCleanup() {
+    console.log("[FILE-CLEANUP] Starting scheduled cleanup...");
+    const maxAge = FILE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    let totalDeleted = 0;
+    const errors: string[] = [];
+
+    // Get all active project sessions
+    const allSessions = sessionManager.getAllSessions();
+
+    for (const projectSession of allSessions) {
+      try {
+        const projectDir = projectSession.workingDir;
+        const projectName = projectSession.projectName;
+        const deleted = await cleanupOldFiles(projectDir, maxAge);
+        totalDeleted += deleted;
+
+        if (deleted > 0) {
+          console.log(`[FILE-CLEANUP] ${projectName}: deleted ${deleted} old files`);
+        }
+      } catch (error) {
+        const errorMsg = `${projectSession.projectName}: ${error instanceof Error ? error.message : String(error)}`;
+        errors.push(errorMsg);
+        console.error(`[FILE-CLEANUP] Error in ${errorMsg}`);
+      }
+    }
+
+    console.log(
+      `[FILE-CLEANUP] Complete: deleted ${totalDeleted} files across ${allSessions.length} projects`
+    );
+    if (errors.length > 0) {
+      console.error(`[FILE-CLEANUP] Errors: ${errors.length}`, errors);
+    }
+  }
+
+  // Run cleanup on startup (delayed 10 seconds)
+  setTimeout(() => {
+    runFileCleanup().catch(console.error);
+  }, 10000);
+
+  // Schedule periodic cleanup
+  cleanupTimer = setInterval(() => {
+    runFileCleanup().catch(console.error);
+  }, CLEANUP_INTERVAL_MS);
+
+  console.log(
+    `[FILE-CLEANUP] Scheduled to run every ${(CLEANUP_INTERVAL_MS / (60 * 60 * 1000)).toFixed(1)} hours (retention: ${FILE_RETENTION_DAYS} days)`
+  );
 
   // Monitor runner task for unexpected termination
   runner.task()?.then(() => {
@@ -721,6 +843,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   // Stop heartbeat
   clearInterval(heartbeatTimer);
+
+  // Stop file cleanup timer
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+  }
 
   // Delete heartbeat file (signals clean shutdown)
   try { unlinkSync(HEARTBEAT_FILE); } catch {}

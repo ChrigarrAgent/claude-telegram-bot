@@ -45,6 +45,7 @@ import type {
   SessionHistory,
   StatusCallback,
   TokenUsage,
+  ModelUsage,
 } from "./types";
 
 /**
@@ -132,6 +133,7 @@ export class ClaudeSession {
   lastError: string | null = null;
   lastErrorTime: Date | null = null;
   lastUsage: TokenUsage | null = null;
+  lastModelUsage: Record<string, ModelUsage> | null = null;
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
 
@@ -280,6 +282,7 @@ export class ClaudeSession {
       allowDangerouslySkipPermissions: true,
       systemPrompt: systemPrompt,
       mcpServers: MCP_SERVERS,
+      disallowedTools: ['AskUserQuestion'], // Disable AskUserQuestion - use plain text instead for better Telegram UX
       // Only include maxThinkingTokens when defined (undefined = SDK default = thinking OFF)
       ...(thinkingTokens !== undefined && { maxThinkingTokens: thinkingTokens }),
       additionalDirectories: ALLOWED_PATHS,
@@ -603,6 +606,22 @@ export class ClaudeSession {
                 u.cache_read_input_tokens || 0
               } cache_create=${u.cache_creation_input_tokens || 0}`
             );
+          }
+
+          // Capture model usage with context window info
+          if ("modelUsage" in event && event.modelUsage) {
+            this.lastModelUsage = event.modelUsage as Record<string, ModelUsage>;
+            // Log context window info for debugging
+            for (const [modelName, usage] of Object.entries(this.lastModelUsage)) {
+              const usedTokens = usage.inputTokens + usage.outputTokens;
+              const percentageUsed = (usedTokens / usage.contextWindow) * 100;
+              console.log(
+                `[CONTEXT] ${modelName}:\n` +
+                `  Input: ${usage.inputTokens}, Output: ${usage.outputTokens}\n` +
+                `  Total: ${usedTokens}/${usage.contextWindow} (${percentageUsed.toFixed(1)}%)\n` +
+                `  Cache read: ${usage.cacheReadInputTokens}, Cache create: ${usage.cacheCreationInputTokens}`
+              );
+            }
           }
         }
       }

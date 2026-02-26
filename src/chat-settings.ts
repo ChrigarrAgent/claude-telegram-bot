@@ -13,7 +13,7 @@ const SETTINGS_FILE = `${homedir()}/.claude/telegram-chat-settings.json`;
 interface ChatSettings {
   voiceMode?: boolean;
   voiceProfile?: string;  // Voice profile ID (default, genz, mentor, etc.)
-  // Future: language?: string, etc.
+  // Note: voiceLanguage is now a global setting (see global-settings.ts)
 }
 
 // Simple map: chatId → settings
