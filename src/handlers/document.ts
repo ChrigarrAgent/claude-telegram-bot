@@ -6,13 +6,15 @@
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
+import { basename, extname } from "path";
+import { statSync, unlinkSync } from "fs";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
-import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
-import { StreamingState, createStatusCallback } from "./streaming";
-import { createMediaGroupBuffer, handleProcessingError } from "./media-group";
-import { isAudioFile, processAudioFile } from "./audio";
+import { auditLog, auditLogRateLimit } from "../utils";
+import { createMediaGroupBuffer } from "./media-group";
+import { getSessionOrReply, sendMessageWithRetry, handleMessageError } from "../helpers";
+import { saveFileToProject } from "../file-forwarder";
+import { createStatusCallback, StreamingState } from "./streaming";
 
 // Supported text file extensions
 const TEXT_EXTENSIONS = [
@@ -54,6 +56,7 @@ const documentBuffer = createMediaGroupBuffer({
 
 /**
  * Download a document and return the local path.
+ * Uses secure path handling to prevent path traversal attacks.
  */
 async function downloadDocument(ctx: Context): Promise<string> {
   const doc = ctx.message?.document;
@@ -62,11 +65,24 @@ async function downloadDocument(ctx: Context): Promise<string> {
   }
 
   const file = await ctx.getFile();
-  const fileName = doc.file_name || `doc_${Date.now()}`;
+  const originalName = doc.file_name || `doc_${Date.now()}`;
 
-  // Sanitize filename
-  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const docPath = `${TEMP_DIR}/${safeName}`;
+  // SECURE: Use basename to strip any directory components (prevents path traversal)
+  const baseName = basename(originalName);
+  const ext = extname(baseName);
+  const nameWithoutExt = ext ? baseName.slice(0, -ext.length) : baseName;
+
+  // Sanitize the name part and limit length
+  let safeName = nameWithoutExt
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 50);
+
+  // Ensure we have a valid name
+  if (!safeName || safeName === "." || safeName === "..") {
+    safeName = `doc_${Date.now()}`;
+  }
+
+  const docPath = `${TEMP_DIR}/${safeName}${ext}`;
 
   // Download
   const response = await fetch(
@@ -214,21 +230,26 @@ async function processArchive(
   fileName: string,
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
-  const stopProcessing = session.startProcessing();
-  const typing = startTypingIndicator(ctx);
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const chatId = ctx.chat?.id!;
+  const stopProcessing = projectSession.session.startProcessing();
 
   // Show extraction progress
   const statusMsg = await ctx.reply(`📦 Extracting <b>${fileName}</b>...`, {
     parse_mode: "HTML",
   });
 
+  let extractDir: string | null = null;
+
   try {
     // Extract archive
     console.log(`Extracting archive: ${fileName}`);
-    const extractDir = await extractArchive(archivePath, fileName);
+    extractDir = await extractArchive(archivePath, fileName);
     const { tree, contents } = await extractArchiveContent(extractDir);
     console.log(`Extracted: ${tree.length} files, ${contents.length} readable`);
 
@@ -252,25 +273,30 @@ async function processArchive(
       : `Please analyze this archive (${fileName}):\n\nFile tree (${tree.length} files):\n${treeStr}\n\nExtracted contents:\n${contentsStr}`;
 
     // Set conversation title (if new session)
-    if (!session.isActive) {
+    if (!projectSession.isActive()) {
       const rawTitle = caption || `[Archivio: ${fileName}]`;
       const title =
         rawTitle.length > 50 ? rawTitle.slice(0, 47) + "..." : rawTitle;
-      session.conversationTitle = title;
+      projectSession.session.conversationTitle = title;
     }
 
-    // Create streaming state
-    const state = new StreamingState();
-    const statusCallback = createStatusCallback(ctx, state);
+    // Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
 
-    const response = await session.sendMessageStreaming(
+    // Send with retry logic
+    const { response } = await sendMessageWithRetry(
+      projectSession,
       prompt,
       username,
       userId,
-      statusCallback,
+      ctx,
       chatId,
-      ctx
+      1,
+      voiceEnabled
     );
+
+    projectSession.updateActivity();
 
     await auditLog(
       userId,
@@ -279,9 +305,6 @@ async function processArchive(
       `[${fileName}] ${caption || ""}`,
       response
     );
-
-    // Cleanup
-    await Bun.$`rm -rf ${extractDir}`.quiet();
 
     // Delete status message
     try {
@@ -301,8 +324,110 @@ async function processArchive(
       `❌ Failed to process archive: ${String(error).slice(0, 100)}`
     );
   } finally {
+    // Cleanup extract directory
+    if (extractDir) {
+      try {
+        await Bun.$`rm -rf ${extractDir}`.quiet();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
     stopProcessing();
-    typing.stop();
+  }
+}
+
+/**
+ * Process a raw document (no parsing, just save to disk).
+ */
+async function processRawDocument(
+  ctx: Context,
+  tempFilePath: string,
+  originalFileName: string,
+  caption: string | undefined,
+  userId: number,
+  username: string
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const projectDir = projectSession.workingDir;
+  const projectName = projectSession.projectName;
+  const stopProcessing = projectSession.session.startProcessing();
+
+  try {
+    // Save file to project directory
+    const savedPath = await saveFileToProject(
+      tempFilePath,
+      originalFileName,
+      projectDir,
+      "files"
+    );
+
+    // Extract user note (remove /raw or /file prefix)
+    const userNote = caption?.replace(/^\/(raw|file)\s*/i, "").trim() || "";
+
+    // Get file info
+    const stats = statSync(savedPath);
+    const relativePath = savedPath.replace(projectDir, ".");
+
+    // Build message for Claude
+    const message = `File forwarded from Telegram:
+
+📄 **File:** ${originalFileName}
+📍 **Path:** ${relativePath}
+📊 **Size:** ${(stats.size / 1024).toFixed(1)} KB
+${userNote ? `\n💬 **User note:** ${userNote}` : ""}
+
+The file has been saved to your working directory. You can read, process, or analyze it using Bash or Read tools.`;
+
+    // Show typing indicator
+    await ctx.replyWithChatAction("typing");
+
+    // Create streaming state
+    const state = new StreamingState();
+
+    // Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
+
+    // Create status callback with working directory for file sending
+    const statusCallback = createStatusCallback(ctx, state, projectName, voiceEnabled, projectSession.workingDir);
+
+    // Send to Claude
+    await projectSession.sendMessage(
+      message,
+      username,
+      userId,
+      statusCallback,
+      chatId,
+      ctx
+    );
+
+    projectSession.updateActivity();
+
+    // Audit log
+    await auditLog(
+      userId,
+      username,
+      "DOCUMENT_RAW",
+      `File: ${originalFileName}, Path: ${relativePath}, Note: ${userNote}`,
+      `(See conversation for Claude's response)`
+    );
+  } catch (error) {
+    console.error("Error in processRawDocument:", error);
+    await ctx.reply(
+      `❌ Failed to save file: ${error instanceof Error ? error.message : String(error)}`
+    );
+  } finally {
+    // Clean up temp file
+    try {
+      unlinkSync(tempFilePath);
+    } catch {}
+    stopProcessing();
   }
 }
 
@@ -314,11 +439,14 @@ async function processDocuments(
   documents: Array<{ path: string; name: string; content: string }>,
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
-  // Mark processing started
-  const stopProcessing = session.startProcessing();
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const chatId = ctx.chat?.id!;
+  const stopProcessing = projectSession.session.startProcessing();
 
   // Build prompt
   let prompt: string;
@@ -337,30 +465,31 @@ async function processDocuments(
   }
 
   // Set conversation title (if new session)
-  if (!session.isActive) {
+  if (!projectSession.isActive()) {
     const docName = documents[0]?.name || "[Documento]";
     const rawTitle = caption || `[Documento: ${docName}]`;
     const title =
       rawTitle.length > 50 ? rawTitle.slice(0, 47) + "..." : rawTitle;
-    session.conversationTitle = title;
+    projectSession.session.conversationTitle = title;
   }
 
-  // Start typing
-  const typing = startTypingIndicator(ctx);
-
-  // Create streaming state
-  const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
-
   try {
-    const response = await session.sendMessageStreaming(
+    // Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
+
+    const { response, state } = await sendMessageWithRetry(
+      projectSession,
       prompt,
       username,
       userId,
-      statusCallback,
+      ctx,
       chatId,
-      ctx
+      1,
+      voiceEnabled
     );
+
+    projectSession.updateActivity();
 
     await auditLog(
       userId,
@@ -370,10 +499,9 @@ async function processDocuments(
       response
     );
   } catch (error) {
-    await handleProcessingError(ctx, error, state.toolMessages);
+    await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
-    typing.stop();
   }
 }
 
@@ -385,8 +513,7 @@ async function processDocumentPaths(
   paths: string[],
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
   // Extract text from all documents
   const documents: Array<{ path: string; name: string; content: string }> = [];
@@ -406,7 +533,7 @@ async function processDocumentPaths(
     return;
   }
 
-  await processDocuments(ctx, documents, caption, userId, username, chatId);
+  await processDocuments(ctx, documents, caption, userId, username);
 }
 
 /**
@@ -416,6 +543,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
   const doc = ctx.message?.document;
   const mediaGroupId = ctx.message?.media_group_id;
 
@@ -443,34 +571,6 @@ export async function handleDocument(ctx: Context): Promise<void> {
     TEXT_EXTENSIONS.includes(extension) || doc.mime_type?.startsWith("text/");
   const isArchiveFile = isArchive(fileName);
 
-  // Check if it's an audio file sent as a document
-  if (!isPdf && !isText && !isArchiveFile && isAudioFile(fileName, doc.mime_type)) {
-    console.log(`Received audio document: ${fileName} from @${username}`);
-
-    // Rate limit check
-    const [allowed, retryAfter] = rateLimiter.check(userId);
-    if (!allowed) {
-      await auditLogRateLimit(userId, username, retryAfter!);
-      await ctx.reply(
-        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
-      );
-      return;
-    }
-
-    // Download and process as audio
-    let docPath: string;
-    try {
-      docPath = await downloadDocument(ctx);
-    } catch (error) {
-      console.error("Failed to download audio document:", error);
-      await ctx.reply("❌ Failed to download audio file.");
-      return;
-    }
-
-    await processAudioFile(ctx, docPath, ctx.message?.caption, userId, username, chatId);
-    return;
-  }
-
   if (!isPdf && !isText && !isArchiveFile) {
     await ctx.reply(
       `❌ Unsupported file type: ${extension || doc.mime_type}\n\n` +
@@ -488,6 +588,30 @@ export async function handleDocument(ctx: Context): Promise<void> {
   } catch (error) {
     console.error("Failed to download document:", error);
     await ctx.reply("❌ Failed to download document.");
+    return;
+  }
+
+  // 4.5. Check for raw mode (file forwarding without parsing)
+  const caption = ctx.message?.caption;
+  const isRawMode =
+    caption?.trim().toLowerCase().startsWith("/raw") ||
+    caption?.trim().toLowerCase().startsWith("/file");
+
+  if (isRawMode) {
+    console.log(`Received raw file: ${fileName} from @${username}`);
+
+    // Rate limit
+    const [allowed, retryAfter] = rateLimiter.check(userId);
+    if (!allowed) {
+      await auditLogRateLimit(userId, username, retryAfter!);
+      await ctx.reply(
+        `⏳ Rate limited. Please wait ${retryAfter!.toFixed(1)} seconds.`
+      );
+      return;
+    }
+
+    // Process as raw file (no parsing)
+    await processRawDocument(ctx, docPath, fileName, caption, userId, username);
     return;
   }
 
@@ -509,8 +633,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
       fileName,
       ctx.message?.caption,
       userId,
-      username,
-      chatId
+      username
     );
     return;
   }
@@ -535,8 +658,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
         [{ path: docPath, name: fileName, content }],
         ctx.message?.caption,
         userId,
-        username,
-        chatId
+        username
       );
     } catch (error) {
       console.error("Failed to extract document:", error);

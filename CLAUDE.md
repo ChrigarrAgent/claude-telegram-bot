@@ -24,8 +24,11 @@ Telegram message → Handler → Auth check → Rate limit → Claude session �
 ### Key Modules
 
 - **`src/index.ts`** - Entry point, registers handlers, starts polling
-- **`src/config.ts`** - Environment parsing, MCP loading, safety prompts
-- **`src/session.ts`** - `ClaudeSession` class wrapping Agent SDK V2 with streaming, session persistence (`/tmp/claude-telegram-session.json`), and defense-in-depth safety checks
+- **`src/config.ts`** - Environment parsing, MCP loading, safety prompts, `resolveProjectPath()`
+- **`src/session.ts`** - `ClaudeSession` class wrapping Agent SDK with streaming and session persistence
+- **`src/session-manager.ts`** - `SessionManager` singleton coordinating multi-project sessions
+- **`src/project-session.ts`** - `ProjectSession` wrapping `ClaudeSession` with project context
+- **`src/project-aliases.ts`** - Human-friendly project names (`~/.claude/telegram-project-aliases.json`)
 - **`src/security.ts`** - `RateLimiter` (token bucket), path validation, command safety checks
 - **`src/formatting.ts`** - Markdown→HTML conversion for Telegram, tool status emoji formatting
 - **`src/utils.ts`** - Audit logging, voice transcription (OpenAI), typing indicators
@@ -101,6 +104,44 @@ When running as a standalone binary (especially from a macOS app), the PATH may 
 
 Without this, `pdftotext` won't be found and PDF parsing will fail silently with an error message.
 
+## Long-Running Processes
+
+The bot supports automatic background process management for commands that might exceed the 180-second query timeout.
+
+### When to Use `long-run`
+
+- Simulations, optimizations, or solvers expected to take >60 seconds
+- Full test suites
+- Data processing or long builds
+
+### When NOT to Use `long-run`
+
+- Quick commands (<30 seconds)
+- Interactive commands (anything needing stdin)
+
+### How It Works
+
+1. Claude uses `long-run <command> [args...]` instead of running the command directly
+2. The command runs in a fully detached background process (immune to parent death)
+3. Claude's Bash tool returns immediately (no timeout risk)
+4. The bot's `ProcessMonitor` polls `/tmp/long-run/` every 5 seconds
+5. When the process completes, the bot notifies the user and auto-resumes Claude
+6. Claude reads the output log and delivers analysis
+
+### Key Files
+
+- **`scripts/long-run`** - Shell wrapper that detaches processes via `setsid`
+- **`src/process-monitor.ts`** - `ProcessMonitor` class polling for completions
+- **`src/config.ts`** - Safety prompt teaches Claude about `long-run`
+
+### Status Files
+
+Located in `/tmp/long-run/`:
+- `<id>.status` - JSON with process state (starting → running → completed)
+- `<id>.log` - stdout+stderr capture
+
+Files are automatically cleaned up after 24 hours.
+
 ## Commit Style
 
 Do not add "Generated with Claude Code" footers or "Co-Authored-By" trailers to commit messages.
@@ -115,4 +156,390 @@ launchctl load ~/Library/LaunchAgents/com.claude-telegram-ts.plist
 # Logs
 tail -f /tmp/claude-telegram-bot-ts.log
 tail -f /tmp/claude-telegram-bot-ts.err
+```
+
+## Multi-Project System
+
+The bot supports multiple concurrent projects with session isolation:
+
+### Key Components
+
+- **`src/session-manager.ts`** - `SessionManager` class coordinates `ProjectSession` instances
+- **`src/project-session.ts`** - Wraps `ClaudeSession` with project-specific context
+- **`src/project-aliases.ts`** - Manages human-friendly project names (stored in `~/.claude/telegram-project-aliases.json`)
+
+### Session Routing
+
+1. Each chat tracks its last-used project via `sessionManager.setLastUsed(chatId, projectName)`
+2. Messages route to the project session, not a global session
+3. Sessions auto-resume from persisted state when recreated
+
+### Project Aliases
+
+- Projects are only added when explicitly used (via `/project`, `@project` syntax, or first message)
+- No auto-scanning of directories on startup
+- Alias file validates paths exist before returning them
+
+### Commands
+
+- `/projects` - Lists all projects with inline keyboard buttons
+- `/project <name>` - Switches to project (creates if doesn't exist)
+- `@projectname message` - Routes message to specific project
+
+## File Forwarding Feature
+
+The bot supports "raw file forwarding" for files that don't need parsing or exceed Telegram's display capabilities.
+
+### Sending Raw Files
+
+Send any file with a caption starting with `/raw` or `/file`:
+
+```
+/raw analyze this sales data
+```
+
+**What happens:**
+1. Bot saves file to `{project}/.claude-bot/files/{timestamp}_{filename}`
+2. Sends file path to Claude (no content extraction)
+3. Claude can read/process using Bash or Read tools
+
+**Use cases:**
+- Large JSON/CSV datasets
+- Binary files (images, PDFs as-is, executables)
+- Archives you want Claude to extract manually
+- Any file type not supported by default parsing
+
+### Large Response Handling
+
+When Claude's response exceeds 3,500 characters:
+1. Full response saved to `{project}/.claude-bot/responses/{timestamp}_response.md`
+2. Intelligent summary sent via Telegram (not just first 500 chars)
+3. Full markdown file uploaded as Telegram document for download
+4. File path provided for local reading
+5. Voice mode receives full text for intelligent summarization
+
+**Configuration:**
+- `RESPONSE_SIZE_THRESHOLD` - Character limit before saving (default: 3500)
+- `AUTO_SAVE_LARGE_RESPONSES` - Enable/disable feature (default: true)
+
+### File Cleanup
+
+**Automatic cleanup:**
+- Runs daily (configurable via `CLEANUP_INTERVAL_MS`)
+- Deletes files older than `FILE_RETENTION_DAYS` (default: 7 days)
+- Affects both `.claude-bot/files/` and `.claude-bot/responses/`
+
+**Manual cleanup:**
+Claude can delete files anytime using Bash:
+```bash
+rm -rf .claude-bot/files/*
+rm -rf .claude-bot/responses/*
+```
+
+**Configuration options:**
+```bash
+FILE_RETENTION_DAYS=7          # Keep files for 7 days
+FILE_RETENTION_DAYS=30         # Keep files for 30 days
+FILE_RETENTION_DAYS=0          # Disable auto-cleanup
+RAW_FILE_MAX_SIZE=52428800     # 50MB max file size
+```
+
+### Security
+
+**Path validation:**
+- Files only saved to project directories within `ALLOWED_PATHS`
+- Directory traversal attacks blocked
+- Filenames sanitized (special chars removed)
+
+**Size limits:**
+- Raw files: 50MB default (configurable)
+- Response files: Unlimited (depends on available disk space)
+
+## Known Issues & Solutions
+
+### Issue: SDK fails silently with non-existent cwd
+
+**Symptom**: No events received from `query()`, bot shows project header but no response
+
+**Cause**: The Claude Agent SDK's `query()` function fails silently when `cwd` points to a non-existent directory
+
+**Fix**:
+1. Validate paths exist in `getProjectByAlias()` before returning them
+2. `resolveProjectPath()` falls back to HOME instead of non-existent paths
+3. Add debug logging: `console.log("DEBUG: Options:", JSON.stringify({cwd: options.cwd, ...}))`
+
+### Issue: Session not resuming when replying to messages
+
+**Symptom**: Bot creates new session instead of continuing conversation
+
+**Cause**: When `_createSession()` creates a new `ClaudeSession`, it didn't load persisted session IDs
+
+**Fix**: In `session-manager.ts`, auto-resume persisted session when creating ProjectSession:
+```typescript
+const savedSessions = claudeSession.getSessionList(projectName);
+if (savedSessions.length > 0) {
+  claudeSession.sessionId = mostRecent.session_id;
+}
+```
+
+### Issue: Claude Code process exits with code 1
+
+**Symptom**: `Error: Claude Code process exited with code 1` for voice/photo/document
+
+**Cause**: Transient Claude Code CLI crashes
+
+**Fix**: All handlers now have retry logic with `MAX_RETRIES = 1`:
+```typescript
+if (errorStr.includes("exited with code") && attempt < MAX_RETRIES) {
+  await projectSession.kill(); // Clear corrupted session
+  await ctx.reply(`⚠️ Claude crashed, retrying...`);
+  continue;
+}
+```
+
+### Issue: 409 Conflict errors
+
+**Symptom**: `GrammyError: 409: Conflict: terminated by other getUpdates request`
+
+**Cause**: Multiple bot instances running simultaneously. This happens when:
+1. A process started outside PM2 (e.g., `bun run start` in terminal) is still running
+2. PM2 crashed but left orphan bun processes
+3. Bot was started manually while PM2 instance was running
+4. Previous PM2 delete didn't kill the actual process
+
+**Diagnosis**:
+```bash
+# Check PM2 status
+pm2 status
+
+# Check actual running processes (should match PM2 pid)
+pgrep -af "bun.*claude"
+
+# If PM2 shows pid X but pgrep shows pid Y, you have a stale process
+```
+
+**Fix**: Kill ALL processes before restarting:
+```bash
+# Full cleanup
+pm2 delete claude-telegram-bot 2>/dev/null
+pkill -9 -f "bun.*claude-telegram-bot"
+sleep 2
+
+# Verify clean
+pgrep -af "bun.*claude"  # Should show nothing
+
+# Start fresh
+pm2 start bun --name claude-telegram-bot -- run start
+```
+
+**Prevention**: Always use PM2 to manage the bot. Never run `bun run start` directly on the server.
+
+### Issue: Project switching uses wrong directory
+
+**Symptom**: After switching projects via `/projects` or `@project` syntax, Claude runs in the wrong directory (e.g., `/home/ubuntu` instead of the project path)
+
+**Cause**: Code was storing the **folder name** (e.g., `ExMasCommuter`) in `lastUsedPerChat` instead of the **alias** (e.g., `exmas-commuter`). When `resolveProjectPath()` later tries to look up `ExMasCommuter`, it can't find it because aliases are lowercase and different from folder names.
+
+**How it happens**:
+```typescript
+// WRONG - extracts folder name from path
+const projName = projectPath.split("/").pop();  // "ExMasCommuter"
+sessionManager.setLastUsed(chatId, projName);
+// Later: resolveProjectPath("ExMasCommuter") fails to find alias
+
+// CORRECT - use the alias directly
+const projName = projectAlias.toLowerCase();  // "exmas-commuter"
+sessionManager.setLastUsed(chatId, projName);
+// Later: resolveProjectPath("exmas-commuter") finds the alias
+```
+
+**Key insight**: The alias file maps `path → alias`:
+```json
+{
+  "/home/ubuntu/Projects/ExMasCommuter": "exmas-commuter",
+  "/home/ubuntu/Projects/resort_ranger": "resort-ranger"
+}
+```
+
+The `resolveProjectPath()` function looks up by alias, not folder name. So `lastUsed` must store the alias.
+
+**Fix**: In all project switching code (`callback.ts`, `text.ts`), use the alias for session tracking:
+```typescript
+// In callback.ts handleProjectCallback() and handleAskUserQuestionCallback()
+const projName = projectName.toLowerCase();  // projectName IS the alias
+sessionManager.setLastUsed(chatId, projName);
+
+// In text.ts @project handling
+const projName = projectAlias!.toLowerCase();  // Use the alias, not folder name
+sessionManager.setLastUsed(chatId, projName);
+```
+
+**Debug logging**: Look for these log lines to trace project switching:
+```bash
+pm2 logs claude-telegram-bot --lines 100 --nostream 2>&1 | grep -E "\[PROJECT-SWITCH\]|\[getProjectNameForChat\]|\[SESSION\] cwd"
+```
+
+Expected output when working correctly:
+```
+[PROJECT-SWITCH] Set lastUsed for chatId=123 to projName=exmas-commuter (alias)
+[getProjectNameForChat] chatId=123, lastUsed=exmas-commuter
+[SESSION] cwd being passed to SDK: /home/ubuntu/Projects/ExMasCommuter
+```
+
+## Debugging Tips
+
+### Debug Logging for SDK Issues
+
+When the bot isn't responding, add debug logging around the SDK query:
+
+```typescript
+console.log("DEBUG: Creating query instance...");
+console.log("DEBUG: Options:", JSON.stringify({
+  model: options.model,
+  cwd: options.cwd,  // CRITICAL: verify this path exists!
+  resume: options.resume,
+}));
+
+let eventCount = 0;
+for await (const event of queryInstance) {
+  eventCount++;
+  console.log(`DEBUG: Event ${eventCount}: type=${event.type}`);
+  // ...
+}
+console.log(`DEBUG: Event loop finished. Total events: ${eventCount}`);
+```
+
+If `eventCount` stays at 0, the SDK is failing silently - check the `cwd` path.
+
+### Checking Bot Logs
+
+```bash
+# Live logs
+pm2 logs claude-telegram-bot
+
+# Recent logs without streaming
+pm2 logs claude-telegram-bot --lines 50 --nostream
+
+# Search for specific errors
+pm2 logs claude-telegram-bot --lines 200 --nostream 2>&1 | grep -E "Error|error|DEBUG"
+```
+
+### Handler Consistency
+
+**IMPORTANT**: There is no global `session` singleton. All handlers must resolve the project session via `sessionManager`:
+
+```typescript
+// CORRECT - resolve session from chat context
+const chatId = ctx.chat?.id;
+const projectName = chatId ? sessionManager.getLastUsed(chatId) : null;
+const projectSession = projectName ? sessionManager.getSession(projectName) : null;
+
+// For sending messages (creates session if needed)
+const projectSession = await sessionManager.getOrCreateSession(projectName);
+await projectSession.sendMessage(message, ...);
+```
+
+To read saved sessions from disk without a class instance, use the standalone function:
+
+```typescript
+import { getSavedSessionList } from "../session";
+const allSessions = getSavedSessionList();               // all sessions
+const filtered = getSavedSessionList("my-project");      // by project
+```
+
+### Path Validation Pattern
+
+Always validate paths before passing to the SDK:
+
+```typescript
+import { existsSync } from "fs";
+
+// In getProjectByAlias()
+if (path && existsSync(path)) {
+  return path;
+}
+return null;  // Don't return non-existent paths
+
+// In resolveProjectPath()
+if (!existsSync(resolved)) {
+  return HOME;  // Fallback to safe default
+}
+```
+
+### Testing Session Resume
+
+To verify session resume is working:
+
+1. Send a message and note the session ID in logs: `GOT session_id: abc123...`
+2. Restart the bot: `pm2 restart claude-telegram-bot`
+3. Send another message to the same project
+4. Check logs for: `Auto-resumed session for <project>: abc123...`
+
+If you see `STARTING new Claude session` instead of `Auto-resumed`, the resume logic isn't working.
+
+## Refactoring Learnings
+
+### No Global Session Singletons
+
+The codebase previously had a `session` singleton (`export const session = new ClaudeSession()`) in both `session.ts` and `session-manager.ts`. This caused `/handoff`, `/tmux`, `/retry`, `/start`, `/new`, and `/stop` to operate on a disconnected `ClaudeSession` that was never used for actual queries. The fix was to remove all singletons and resolve sessions through `sessionManager` using the chat-to-project mapping.
+
+**Rule**: Never create a standalone `ClaudeSession` for command handlers. Always resolve via `sessionManager.getLastUsed(chatId)` + `sessionManager.getSession(projectName)`.
+
+### Prefer Standalone Functions Over Throwaway Instances
+
+When you only need to read data (like the session history file), don't instantiate a whole class. Extract the logic into a standalone exported function (`getSavedSessionList()`, `loadSessionHistory()`) that any caller can use without side effects.
+
+### Sync File I/O for Shared State
+
+`saveSession()` used `Bun.write()` (async, fire-and-forget) while `loadSessionHistory()` used `readFileSync()`. With multiple concurrent project sessions, this caused race conditions where one session's write hadn't flushed before another's read. Fix: use `writeFileSync()` for shared state files like session persistence. Async writes are fine for logs or temp files, not for state that's read back immediately.
+
+### `Bun.file().size` vs `existsSync()`
+
+`Bun.file(path).size` throws or returns 0 for missing files depending on the Bun version — it's unreliable as an existence check. Use `existsSync()` from Node's `fs` module instead.
+
+### Always Use Consolidated Status Callbacks
+
+**Symptom**: After resuming from a long-running task (or auto-continuing after restart/crash), every tool call and text event was sent as its own separate Telegram message instead of being consolidated into one updating "Working..." message.
+
+**Cause**: `handleProcessCompletion()` and `autoContinueSession()` in `index.ts` used inline status callbacks that sent each `tool` event as a new message and only handled `text` and `tool` events. They didn't handle `thinking`, `segment_end`, or `done`, and didn't accumulate progress into a single working message.
+
+**Fix**: Created `createBotApiStatusCallback(api, chatId, projectAlias)` in `streaming.ts` that mirrors the exact same consolidated pattern as `createStatusCallback(ctx, state, projectAlias)` but works with `bot.api` + `chatId` instead of a grammY `ctx` object. Replaced both inline callbacks with calls to this function.
+
+**Rule**: Never write inline status callbacks. All code paths that receive streaming events from Claude must use one of:
+- `createStatusCallback(ctx, state, projectAlias)` — when a grammY `ctx` is available (normal message handlers)
+- `createBotApiStatusCallback(api, chatId, projectAlias)` — when only `bot.api` + `chatId` are available (startup resume, process completion, anything outside a handler)
+
+## Running on Ubuntu Server (PM2)
+
+```bash
+# Start with PM2
+pm2 start ecosystem.config.js
+
+# Or directly
+pm2 start "bun run start" --name claude-telegram-bot
+
+# View status
+pm2 status
+
+# Restart after code changes
+pm2 restart claude-telegram-bot
+
+# Stop
+pm2 stop claude-telegram-bot
+```
+
+### ecosystem.config.js
+
+```javascript
+module.exports = {
+  apps: [{
+    name: 'claude-telegram-bot',
+    script: 'bun',
+    args: 'run start',
+    cwd: '/home/ubuntu/Projects/claude-telegram-bot',
+    env: {
+      NODE_ENV: 'production',
+    },
+  }],
+};
 ```

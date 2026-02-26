@@ -10,12 +10,14 @@ import {
   type Options,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import type { Context } from "grammy";
 import {
   ALLOWED_PATHS,
+  CLAUDE_CLI_PATH,
   MCP_SERVERS,
-  SAFETY_PROMPT,
+  QUERY_TIMEOUT_MS,
+  SYSTEM_PROMPT,
   SESSION_FILE,
   STREAMING_THROTTLE_MS,
   TEMP_PATHS,
@@ -26,32 +28,47 @@ import {
 } from "./config";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
+import {
+  isAskUserQuestionInput,
+  displayAskUserQuestions,
+} from "./handlers/ask-user-question";
+import {
+  requestSafetyConfirmation,
+  waitForSafetyDecision,
+} from "./handlers/safety-confirmation";
 import { checkCommandSafety, isPathAllowed } from "./security";
+import { getProjectAlias } from "./project-aliases";
+import { sessionManager } from "./session-manager";
 import type {
+  AskUserQuestionInput,
   SavedSession,
   SessionHistory,
   StatusCallback,
   TokenUsage,
+  ModelUsage,
 } from "./types";
 
 /**
  * Determine thinking token budget based on message keywords.
+ * Default: thinking is ON (10000 tokens)
+ * Use /fast or /f to disable thinking (returns undefined to omit maxThinkingTokens)
+ * Use deep thinking keywords for extended thinking (50000 tokens)
  */
-function getThinkingLevel(message: string): number {
+function getThinkingLevel(message: string): number | undefined {
   const msgLower = message.toLowerCase();
 
-  // Check deep thinking triggers first (more specific)
+  // Check for fast mode (disable thinking) - use word boundary regex to avoid matching /fix, /format, etc.
+  if (/\/fast\b/i.test(message) || /\/f\b/i.test(message)) {
+    return undefined; // Don't pass maxThinkingTokens → SDK default (thinking OFF)
+  }
+
+  // Check deep thinking triggers (more thinking tokens)
   if (THINKING_DEEP_KEYWORDS.some((k) => msgLower.includes(k))) {
     return 50000;
   }
 
-  // Check normal thinking triggers
-  if (THINKING_KEYWORDS.some((k) => msgLower.includes(k))) {
-    return 10000;
-  }
-
-  // Default: no thinking
-  return 0;
+  // Default: normal thinking ON
+  return 10000;
 }
 
 /**
@@ -72,10 +89,42 @@ function getTextFromMessage(msg: SDKMessage): string | null {
 /**
  * Manages Claude Code sessions using the Agent SDK V1.
  */
-// Maximum number of sessions to keep in history
-const MAX_SESSIONS = 5;
+// Maximum number of sessions to keep per project
+const SESSIONS_PER_PROJECT = 3;
+const DEFAULT_PROJECT_NAME = "default";
 
-class ClaudeSession {
+/**
+ * Load session history from disk (standalone, no class instance needed).
+ */
+export function loadSessionHistory(): SessionHistory {
+  try {
+    if (!existsSync(SESSION_FILE)) {
+      return { sessions: [] };
+    }
+
+    const text = readFileSync(SESSION_FILE, "utf-8");
+    return JSON.parse(text) as SessionHistory;
+  } catch {
+    return { sessions: [] };
+  }
+}
+
+/**
+ * Get saved sessions list (standalone, no class instance needed).
+ */
+export function getSavedSessionList(filterByProject?: string): SavedSession[] {
+  const history = loadSessionHistory();
+
+  if (filterByProject !== undefined) {
+    return history.sessions.filter(
+      (s) => s.project === filterByProject || s.working_dir === filterByProject
+    );
+  }
+
+  return history.sessions;
+}
+
+export class ClaudeSession {
   sessionId: string | null = null;
   lastActivity: Date | null = null;
   queryStarted: Date | null = null;
@@ -84,6 +133,7 @@ class ClaudeSession {
   lastError: string | null = null;
   lastErrorTime: Date | null = null;
   lastUsage: TokenUsage | null = null;
+  lastModelUsage: Record<string, ModelUsage> | null = null;
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
 
@@ -92,6 +142,10 @@ class ClaudeSession {
   private stopRequested = false;
   private _isProcessing = false;
   private _wasInterruptedByNewMessage = false;
+  private _resumeAttempted = false; // Track if we tried to resume from disk
+  private typingInterval: Timer | null = null; // Typing indicator control
+  private currentCtx: Context | null = null; // Current context for typing
+  private typingIntervalId = 0; // Unique ID for each typing interval
 
   get isActive(): boolean {
     return this.sessionId !== null;
@@ -145,6 +199,9 @@ class ClaudeSession {
    * Returns: "stopped" if query was aborted, "pending" if processing will be cancelled, false if nothing running
    */
   async stop(): Promise<"stopped" | "pending" | false> {
+    // Always stop typing indicator when stopping
+    this.stopTyping();
+
     // If a query is actively running, abort it
     if (this.isQueryRunning && this.abortController) {
       this.stopRequested = true;
@@ -174,21 +231,28 @@ class ClaudeSession {
     userId: number,
     statusCallback: StatusCallback,
     chatId?: number,
-    ctx?: Context
+    ctx?: Context,
+    workingDir?: string
   ): Promise<string> {
     // Set chat context for ask_user MCP tool
     if (chatId) {
       process.env.TELEGRAM_CHAT_ID = String(chatId);
     }
 
+    // Store context for typing indicator
+    this.currentCtx = ctx || null;
+
     const isNewSession = !this.isActive;
     const thinkingTokens = getThinkingLevel(message);
     const thinkingLabel =
-      { 0: "off", 10000: "normal", 50000: "deep" }[thinkingTokens] ||
-      String(thinkingTokens);
+      thinkingTokens === undefined
+        ? "off"
+        : { 10000: "normal", 50000: "deep" }[thinkingTokens] || String(thinkingTokens);
+
+    // Strip /fast or /f from message before sending to Claude
+    let messageToSend = message.replace(/\/fast\b/gi, "").replace(/\/f\b/gi, "").trim();
 
     // Inject current date/time at session start so Claude doesn't need to call a tool for it
-    let messageToSend = message;
     if (isNewSession) {
       const now = new Date();
       const datePrefix = `[Current date/time: ${now.toLocaleDateString(
@@ -203,26 +267,33 @@ class ClaudeSession {
           timeZoneName: "short",
         }
       )}]\n\n`;
-      messageToSend = datePrefix + message;
+      messageToSend = datePrefix + messageToSend;
     }
+
+    // Use standard system prompt - voice rewriting is handled by Gemini, not Claude
+    const systemPrompt = SYSTEM_PROMPT;
 
     // Build SDK V1 options - supports all features
     const options: Options = {
       model: "claude-sonnet-4-5",
-      cwd: getWorkingDir(),
+      cwd: workingDir || getWorkingDir(),
       settingSources: ["user", "project"],
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
-      systemPrompt: SAFETY_PROMPT,
+      systemPrompt: systemPrompt,
       mcpServers: MCP_SERVERS,
-      maxThinkingTokens: thinkingTokens,
+      disallowedTools: ['AskUserQuestion'], // Disable AskUserQuestion - use plain text instead for better Telegram UX
+      // Only include maxThinkingTokens when defined (undefined = SDK default = thinking OFF)
+      ...(thinkingTokens !== undefined && { maxThinkingTokens: thinkingTokens }),
       additionalDirectories: ALLOWED_PATHS,
       resume: this.sessionId || undefined,
     };
 
-    // Add Claude Code executable path if set (required for standalone builds)
-    if (process.env.CLAUDE_CODE_PATH) {
-      options.pathToClaudeCodeExecutable = process.env.CLAUDE_CODE_PATH;
+    // Add Claude Code executable path - use config or env
+    const claudePath = process.env.CLAUDE_CODE_PATH || CLAUDE_CLI_PATH;
+    if (claudePath) {
+      options.pathToClaudeCodeExecutable = claudePath;
+      console.log(`DEBUG: Claude CLI path: ${claudePath}`);
     }
 
     if (this.sessionId && !isNewSession) {
@@ -236,6 +307,9 @@ class ClaudeSession {
       console.log(`STARTING new Claude session (thinking=${thinkingLabel})`);
       this.sessionId = null;
     }
+
+    // DEBUG: Log the working directory being passed to Claude
+    console.log(`[SESSION] cwd being passed to SDK: ${options.cwd}`);
 
     // Check if stop was requested during processing phase
     if (this.stopRequested) {
@@ -253,6 +327,9 @@ class ClaudeSession {
     this.queryStarted = new Date();
     this.currentTool = null;
 
+    // Start typing indicator now that query is actually running
+    this.startTyping();
+
     // Response tracking
     const responseParts: string[] = [];
     let currentSegmentId = 0;
@@ -261,18 +338,62 @@ class ClaudeSession {
     let queryCompleted = false;
     let askUserTriggered = false;
 
+    // Activity timeout - abort if no events received for too long
+    let activityTimeout: Timer | null = null;
+    const resetActivityTimeout = () => {
+      if (activityTimeout) clearTimeout(activityTimeout);
+      activityTimeout = setTimeout(() => {
+        console.warn(`Query timeout - no activity for ${QUERY_TIMEOUT_MS / 1000}s`);
+        this.stopRequested = true;
+        this.abortController?.abort();
+      }, QUERY_TIMEOUT_MS);
+    };
+    const clearActivityTimeout = () => {
+      if (activityTimeout) {
+        clearTimeout(activityTimeout);
+        activityTimeout = null;
+      }
+    };
+
     try {
       // Use V1 query() API - supports all options including cwd, mcpServers, etc.
-      const queryInstance = query({
-        prompt: messageToSend,
-        options: {
-          ...options,
-          abortController: this.abortController,
-        },
-      });
+      console.log("DEBUG: Creating query instance...");
+      console.log("DEBUG: Options:", JSON.stringify({
+        model: options.model,
+        cwd: options.cwd,
+        resume: options.resume,
+        maxThinkingTokens: options.maxThinkingTokens,
+      }));
+
+      let queryInstance;
+      try {
+        queryInstance = query({
+          prompt: messageToSend,
+          options: {
+            ...options,
+            abortController: this.abortController,
+          },
+        });
+        console.log("DEBUG: Query instance created successfully");
+      } catch (queryError) {
+        console.error("DEBUG: Error creating query instance:", queryError);
+        throw queryError;
+      }
+
+      // Start activity timeout
+      resetActivityTimeout();
+
+      console.log("DEBUG: Starting event loop...");
+      let eventCount = 0;
 
       // Process streaming response
       for await (const event of queryInstance) {
+        eventCount++;
+        console.log(`DEBUG: Event ${eventCount}: type=${event.type}`);
+
+        // Reset timeout on any activity
+        resetActivityTimeout();
+
         // Check for abort
         if (this.stopRequested) {
           console.log("Query aborted by user");
@@ -282,8 +403,12 @@ class ClaudeSession {
         // Capture session_id from first message
         if (!this.sessionId && event.session_id) {
           this.sessionId = event.session_id;
+          this._resumeAttempted = false; // Session validated successfully
           console.log(`GOT session_id: ${this.sessionId!.slice(0, 8)}...`);
-          this.saveSession();
+          this.saveSession(workingDir);
+        } else if (this.sessionId && this._resumeAttempted) {
+          // Resume was successful - got events with existing session_id
+          this._resumeAttempted = false;
         }
 
         // Handle different message types
@@ -304,18 +429,38 @@ class ClaudeSession {
               const toolInput = block.input as Record<string, unknown>;
 
               // Safety check for Bash commands
-              if (toolName === "Bash") {
+              if (toolName === "Bash" && ctx && chatId) {
                 const command = String(toolInput.command || "");
                 const [isSafe, reason] = checkCommandSafety(command);
                 if (!isSafe) {
-                  console.warn(`BLOCKED: ${reason}`);
-                  await statusCallback("tool", `BLOCKED: ${reason}`);
-                  throw new Error(`Unsafe command blocked: ${reason}`);
+                  console.warn(`UNSAFE COMMAND: ${reason} - requesting confirmation`);
+                  await statusCallback("tool", `⚠️ Requesting confirmation for: ${reason}`);
+
+                  // Request confirmation via Telegram buttons
+                  const requestId = await requestSafetyConfirmation(
+                    ctx,
+                    chatId,
+                    "command",
+                    reason,
+                    command
+                  );
+
+                  // Wait for user decision
+                  const allowed = await waitForSafetyDecision(requestId);
+
+                  if (!allowed) {
+                    console.warn(`User denied: ${reason}`);
+                    await statusCallback("tool", `❌ Command blocked by user: ${reason}`);
+                    throw new Error(`Command blocked by user: ${reason}`);
+                  }
+
+                  console.log(`User allowed: ${command}`);
+                  await statusCallback("tool", `✅ Command allowed by user`);
                 }
               }
 
               // Safety check for file operations
-              if (["Read", "Write", "Edit"].includes(toolName)) {
+              if (["Read", "Write", "Edit"].includes(toolName) && ctx && chatId) {
                 const filePath = String(toolInput.file_path || "");
                 if (filePath) {
                   // Allow reads from temp paths and .claude directories
@@ -326,10 +471,30 @@ class ClaudeSession {
 
                   if (!isTmpRead && !isPathAllowed(filePath)) {
                     console.warn(
-                      `BLOCKED: File access outside allowed paths: ${filePath}`
+                      `UNSAFE FILE OPERATION: Access outside allowed paths: ${filePath} - requesting confirmation`
                     );
-                    await statusCallback("tool", `Access denied: ${filePath}`);
-                    throw new Error(`File access blocked: ${filePath}`);
+                    await statusCallback("tool", `🔒 Requesting confirmation for file access`);
+
+                    // Request confirmation via Telegram buttons
+                    const requestId = await requestSafetyConfirmation(
+                      ctx,
+                      chatId,
+                      "file_operation",
+                      `${toolName} file outside allowed paths`,
+                      filePath
+                    );
+
+                    // Wait for user decision
+                    const allowed = await waitForSafetyDecision(requestId);
+
+                    if (!allowed) {
+                      console.warn(`User denied file access: ${filePath}`);
+                      await statusCallback("tool", `❌ File access blocked by user: ${filePath}`);
+                      throw new Error(`File access blocked by user: ${filePath}`);
+                    }
+
+                    console.log(`User allowed file access: ${filePath}`);
+                    await statusCallback("tool", `✅ File access allowed by user`);
                   }
                 }
               }
@@ -345,14 +510,36 @@ class ClaudeSession {
                 currentSegmentText = "";
               }
 
+              // Check for AskUserQuestion format (used by GSD and similar plugins)
+              // This works regardless of tool name - we detect by input structure
+              if (isAskUserQuestionInput(toolInput) && ctx && chatId) {
+                const effectiveCwd = workingDir || getWorkingDir();
+                const projectName = effectiveCwd.split("/").pop() || "default";
+                const projectAlias = getProjectAlias(effectiveCwd);
+
+                const displayed = await displayAskUserQuestions(
+                  ctx,
+                  toolInput as AskUserQuestionInput,
+                  projectName,
+                  projectAlias,
+                  chatId
+                );
+
+                if (displayed) {
+                  askUserTriggered = true;
+                  // Don't show tool status for AskUserQuestion - buttons are displayed
+                  console.log(`AskUserQuestion displayed for ${projectName}`);
+                }
+              }
+
               // Format and show tool status
               const toolDisplay = formatToolStatus(toolName, toolInput);
               this.currentTool = toolDisplay;
               this.lastTool = toolDisplay;
               console.log(`Tool: ${toolDisplay}`);
 
-              // Don't show tool status for ask_user - the buttons are self-explanatory
-              if (!toolName.startsWith("mcp__ask-user")) {
+              // Don't show tool status for ask_user or AskUserQuestion - the buttons are self-explanatory
+              if (!toolName.startsWith("mcp__ask-user") && !askUserTriggered) {
                 await statusCallback("tool", toolDisplay);
               }
 
@@ -420,14 +607,50 @@ class ClaudeSession {
               } cache_create=${u.cache_creation_input_tokens || 0}`
             );
           }
+
+          // Capture model usage with context window info
+          if ("modelUsage" in event && event.modelUsage) {
+            this.lastModelUsage = event.modelUsage as Record<string, ModelUsage>;
+            // Log context window info for debugging
+            for (const [modelName, usage] of Object.entries(this.lastModelUsage)) {
+              const usedTokens = usage.inputTokens + usage.outputTokens;
+              const percentageUsed = (usedTokens / usage.contextWindow) * 100;
+              console.log(
+                `[CONTEXT] ${modelName}:\n` +
+                `  Input: ${usage.inputTokens}, Output: ${usage.outputTokens}\n` +
+                `  Total: ${usedTokens}/${usage.contextWindow} (${percentageUsed.toFixed(1)}%)\n` +
+                `  Cache read: ${usage.cacheReadInputTokens}, Cache create: ${usage.cacheCreationInputTokens}`
+              );
+            }
+          }
         }
       }
+
+      console.log(`DEBUG: Event loop finished. Total events: ${eventCount}, completed: ${queryCompleted}`);
 
       // V1 query completes automatically when the generator ends
     } catch (error) {
       const errorStr = String(error).toLowerCase();
       const isCleanupError =
         errorStr.includes("cancel") || errorStr.includes("abort");
+
+      // Check if this was a resume failure (session not found, invalid, expired)
+      const isResumeFailure =
+        this._resumeAttempted &&
+        (errorStr.includes("session") ||
+          errorStr.includes("not found") ||
+          errorStr.includes("invalid") ||
+          errorStr.includes("expired"));
+
+      if (isResumeFailure) {
+        console.warn(`Resume failed, will start fresh session: ${error}`);
+        // Clear the failed session so next attempt starts fresh
+        this.sessionId = null;
+        this._resumeAttempted = false;
+        this.lastError = "Resume failed - starting fresh session";
+        this.lastErrorTime = new Date();
+        throw new Error("Session resume failed - please retry");
+      }
 
       if (
         isCleanupError &&
@@ -441,10 +664,13 @@ class ClaudeSession {
         throw error;
       }
     } finally {
+      this.stopTyping(); // Always stop typing when query ends
+      clearActivityTimeout();
       this.isQueryRunning = false;
       this.abortController = null;
       this.queryStarted = null;
       this.currentTool = null;
+      this.currentCtx = null; // Clear context reference
     }
 
     this.lastActivity = new Date();
@@ -468,29 +694,102 @@ class ClaudeSession {
   }
 
   /**
+   * Start typing indicator.
+   */
+  private startTyping(): void {
+    // Stop any existing typing first
+    this.stopTyping();
+
+    if (this.currentCtx && !this.typingInterval) {
+      // Generate unique ID for this interval
+      const intervalId = ++this.typingIntervalId;
+      console.log(`[TYPING] Starting typing indicator #${intervalId} (session: ${this.sessionId?.slice(0, 8)})`);
+
+      this.typingInterval = setInterval(async () => {
+        // Check if this is still the active interval (prevents stale callbacks)
+        if (intervalId !== this.typingIntervalId || !this.currentCtx) {
+          console.log(`[TYPING] Interval #${intervalId} fired but is stale (current: ${this.typingIntervalId}), skipping`);
+          return;
+        }
+        console.log(`[TYPING] Sending typing action (interval #${intervalId})`);
+        try {
+          await this.currentCtx.replyWithChatAction("typing");
+        } catch (error) {
+          console.debug("Typing indicator failed:", error);
+        }
+      }, 4000);
+      // Send immediately
+      console.log(`[TYPING] Sending typing action (immediate #${intervalId})`);
+      this.currentCtx.replyWithChatAction("typing").catch(() => {});
+    }
+  }
+
+  /**
+   * Stop typing indicator.
+   */
+  private stopTyping(): void {
+    console.log(`[TYPING] Stopping typing indicator #${this.typingIntervalId} (session: ${this.sessionId?.slice(0, 8)}, isQueryRunning: ${this.isQueryRunning})`);
+    // Increment ID to invalidate any queued callbacks from old interval
+    this.typingIntervalId++;
+    if (this.typingInterval) {
+      console.log(`[TYPING] Clearing interval, new ID: ${this.typingIntervalId}`);
+      clearInterval(this.typingInterval);
+      this.typingInterval = null;
+    }
+  }
+
+  /**
    * Kill the current session (clear session_id).
    */
   async kill(): Promise<void> {
+    this.stopTyping(); // Ensure typing is stopped
     this.sessionId = null;
     this.lastActivity = null;
     this.conversationTitle = null;
+    this.currentCtx = null;
     console.log("Session cleared");
+  }
+
+  /**
+   * Trim session history to keep only SESSIONS_PER_PROJECT per project.
+   * Groups sessions by project and keeps the most recent sessions for each.
+   */
+  private trimSessionHistory(history: SessionHistory): void {
+    const groupedByProject = new Map<string, SavedSession[]>();
+
+    // Group sessions by project
+    for (const session of history.sessions) {
+      const projName = session.project || DEFAULT_PROJECT_NAME;
+      if (!groupedByProject.has(projName)) {
+        groupedByProject.set(projName, []);
+      }
+      groupedByProject.get(projName)!.push(session);
+    }
+
+    // Trim each project to SESSIONS_PER_PROJECT
+    const trimmedSessions: SavedSession[] = [];
+    for (const [, sessions] of groupedByProject.entries()) {
+      // Keep only the most recent SESSIONS_PER_PROJECT for this project
+      trimmedSessions.push(...sessions.slice(0, SESSIONS_PER_PROJECT));
+    }
+
+    history.sessions = trimmedSessions;
   }
 
   /**
    * Save session to disk for resume after restart.
    * Saves to multi-session history format.
    */
-  saveSession(): void {
+  saveSession(overrideWorkingDir?: string): void {
     if (!this.sessionId) return;
 
     try {
       // Load existing session history
-      const history = this.loadSessionHistory();
+      const history = loadSessionHistory();
 
       // Create new session entry with project name
-      const workDir = getWorkingDir();
-      const projectName = workDir.split("/").pop() || "home";
+      const workDir = overrideWorkingDir || getWorkingDir();
+      const projectName = workDir.split("/").pop() || DEFAULT_PROJECT_NAME;
       const newSession: SavedSession = {
         session_id: this.sessionId,
         saved_at: new Date().toISOString(),
@@ -510,11 +809,11 @@ class ClaudeSession {
         history.sessions.unshift(newSession);
       }
 
-      // Keep only the last MAX_SESSIONS
-      history.sessions = history.sessions.slice(0, MAX_SESSIONS);
+      // Keep only the last SESSIONS_PER_PROJECT per project
+      this.trimSessionHistory(history);
 
       // Save
-      Bun.write(SESSION_FILE, JSON.stringify(history, null, 2));
+      writeFileSync(SESSION_FILE, JSON.stringify(history, null, 2), "utf-8");
       console.log(`Session saved to ${SESSION_FILE}`);
     } catch (error) {
       console.warn(`Failed to save session: ${error}`);
@@ -522,50 +821,28 @@ class ClaudeSession {
   }
 
   /**
-   * Load session history from disk.
-   */
-  private loadSessionHistory(): SessionHistory {
-    try {
-      const file = Bun.file(SESSION_FILE);
-      if (!file.size) {
-        return { sessions: [] };
-      }
-
-      const text = readFileSync(SESSION_FILE, "utf-8");
-      return JSON.parse(text) as SessionHistory;
-    } catch {
-      return { sessions: [] };
-    }
-  }
-
-  /**
    * Get list of saved sessions for display.
+   * @param filterByProject - Optional project name to filter by (if undefined, returns all sessions)
    */
-  getSessionList(): SavedSession[] {
-    const history = this.loadSessionHistory();
-    // Filter to only sessions for current working directory
-    return history.sessions.filter(
-      (s) => !s.working_dir || s.working_dir === WORKING_DIR
-    );
+  getSessionList(filterByProject?: string): SavedSession[] {
+    return getSavedSessionList(filterByProject);
   }
 
   /**
    * Resume a specific session by ID.
    */
   resumeSession(sessionId: string): [success: boolean, message: string] {
-    const history = this.loadSessionHistory();
+    const history = loadSessionHistory();
     const sessionData = history.sessions.find((s) => s.session_id === sessionId);
 
     if (!sessionData) {
-      return [false, "Sessione non trovata"];
+      return [false, "Session not found"];
     }
 
-    if (sessionData.working_dir && sessionData.working_dir !== WORKING_DIR) {
-      return [
-        false,
-        `Sessione per directory diversa: ${sessionData.working_dir}`,
-      ];
-    }
+    // NOTE: We don't check working_dir anymore because:
+    // 1. WORKING_DIR is a stale constant from startup time
+    // 2. Multi-project sessions should be resumable regardless of current dir
+    // 3. The SDK's resume parameter handles directory mismatches gracefully
 
     this.sessionId = sessionData.session_id;
     this.conversationTitle = sessionData.title;
@@ -577,7 +854,7 @@ class ClaudeSession {
 
     return [
       true,
-      `Ripresa sessione: "${sessionData.title}"`,
+      `Resumed session: "${sessionData.title}"`,
     ];
   }
 
@@ -587,12 +864,10 @@ class ClaudeSession {
   resumeLast(): [success: boolean, message: string] {
     const sessions = this.getSessionList();
     if (sessions.length === 0) {
-      return [false, "Nessuna sessione salvata"];
+      return [false, "No saved sessions"];
     }
 
     return this.resumeSession(sessions[0]!.session_id);
   }
 }
 
-// Global session instance
-export const session = new ClaudeSession();

@@ -5,9 +5,12 @@
 import type { Context } from "grammy";
 import type { Message } from "grammy/types";
 
+// Status type for streaming updates
+export type StatusType = "thinking" | "tool" | "text" | "segment_end" | "done";
+
 // Status callback for streaming updates
 export type StatusCallback = (
-  type: "thinking" | "tool" | "text" | "segment_end" | "done",
+  type: StatusType,
   content: string,
   segmentId?: number
 ) => Promise<void>;
@@ -37,6 +40,18 @@ export interface TokenUsage {
   output_tokens: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
+}
+
+// Model usage with context window info (from SDK result event)
+export interface ModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  webSearchRequests: number;
+  costUSD: number;
+  contextWindow: number; // Total context window size
+  maxOutputTokens: number; // Max output tokens per response
 }
 
 // MCP server configuration types
@@ -81,3 +96,56 @@ export interface PendingMediaGroup {
 
 // Bot context with optional message
 export type BotContext = Context;
+
+// Active sessions tracking for restart/resume
+export interface ActiveSessionEntry {
+  chat_id: number;
+  project_name: string;
+  session_id: string;
+  last_message?: string;
+  was_running: boolean;
+}
+
+export interface ActiveSessionsData {
+  shutdown_time: string;
+  reason: "signal" | "restart" | "crash";
+  sessions: ActiveSessionEntry[];
+}
+
+// Heartbeat data for crash detection
+export interface HeartbeatData {
+  pid: number;
+  started_at: string;
+  last_heartbeat: string;
+  sessions: ActiveSessionEntry[];
+}
+
+// AskUserQuestion types (for GSD and similar plugins)
+export interface AskUserQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface AskUserQuestion {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: AskUserQuestionOption[];
+}
+
+export interface AskUserQuestionInput {
+  questions: AskUserQuestion[];
+}
+
+export interface PendingAskUserQuestion {
+  requestId: string;
+  projectName: string;
+  chatId: number;
+  messageIds: number[];
+  questions: AskUserQuestion[];
+  currentQuestionIndex: number;
+  selectedIndices: Map<number, Set<number>>; // questionIndex → selected option indices
+  awaitingFreeText: boolean;
+  createdAt: Date;
+  expiresAt: Date;
+}

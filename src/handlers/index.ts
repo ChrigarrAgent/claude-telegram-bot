@@ -13,12 +13,25 @@ export {
   handleHandoff,
   handleTmux,
   handleProject,
+  handleProjects,
+  handleUsage,
+  handleVoice as handleVoiceCommand,
+  handleLink,
+  handleVerify,
+  handleUnlink,
+  handleHelp,
 } from "./commands";
 export { handleText } from "./text";
 export { handleVoice } from "./voice";
 export { handlePhoto } from "./photo";
 export { handleDocument } from "./document";
-export { handleAudio } from "./audio";
-export { handleVideo } from "./video";
 export { handleCallback } from "./callback";
-export { StreamingState, createStatusCallback } from "./streaming";
+export { StreamingState, createStatusCallback, createBotApiStatusCallback } from "./streaming";
+export {
+  isAskUserQuestionInput,
+  displayAskUserQuestions,
+  formatQuestionMessage,
+  createQuestionKeyboard,
+  handleFreeTextQuestionResponse,
+  formatSelectionsForClaude,
+} from "./ask-user-question";

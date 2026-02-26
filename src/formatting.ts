@@ -16,15 +16,87 @@ export function escapeHtml(text: string): string {
 }
 
 /**
+ * Convert a Markdown table to a formatted monospace table.
+ */
+function convertMarkdownTable(tableText: string): string {
+  const lines = tableText.trim().split("\n");
+  if (lines.length < 2) return tableText;
+
+  // Parse rows (skip separator line with dashes)
+  const rows: string[][] = [];
+  for (const line of lines) {
+    // Skip separator lines (|---|---|)
+    if (/^\|?\s*[-:]+\s*\|/.test(line)) continue;
+
+    const cells = line
+      .split("|")
+      .map(c => c.trim())
+      .filter((c, i, arr) => i > 0 || c !== ""); // Remove empty first cell from leading |
+
+    // Remove empty last cell from trailing |
+    if (cells.length > 0 && cells[cells.length - 1] === "") {
+      cells.pop();
+    }
+
+    if (cells.length > 0) {
+      rows.push(cells);
+    }
+  }
+
+  if (rows.length === 0) return tableText;
+
+  // Calculate column widths
+  const colWidths: number[] = [];
+  for (const row of rows) {
+    for (let i = 0; i < row.length; i++) {
+      colWidths[i] = Math.max(colWidths[i] || 0, row[i]!.length);
+    }
+  }
+
+  // Build formatted table
+  const output: string[] = [];
+  const separator = "─".repeat(colWidths.reduce((a, b) => a + b, 0) + colWidths.length * 3 + 1);
+
+  output.push(separator);
+
+  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const row = rows[rowIdx]!;
+    const formattedCells = row.map((cell, i) => cell.padEnd(colWidths[i] || 0));
+    output.push("│ " + formattedCells.join(" │ ") + " │");
+
+    // Add separator after header row
+    if (rowIdx === 0 && rows.length > 1) {
+      output.push(separator);
+    }
+  }
+
+  output.push(separator);
+
+  return "<pre>" + output.join("\n") + "</pre>";
+}
+
+import {
+  getTableRenderingStrategy,
+  convertTableToList,
+  renderTableToImage,
+  generateTableCSV,
+  type TableStrategy,
+} from "./table-renderer";
+
+/**
  * Convert standard markdown to Telegram-compatible HTML.
  *
  * HTML is more reliable than Telegram's Markdown which breaks on special chars.
  * Telegram HTML supports: <b>, <i>, <code>, <pre>, <a href="">
+ *
+ * @param text - Markdown text to convert
+ * @param workingDir - Optional working directory for saving table images/CSV files
  */
-export function convertMarkdownToHtml(text: string): string {
+export async function convertMarkdownToHtml(text: string, workingDir?: string): Promise<string> {
   // Store code blocks temporarily to avoid processing their contents
   const codeBlocks: string[] = [];
   const inlineCodes: string[] = [];
+  const tables: Array<{ markdown: string; strategy: TableStrategy }> = [];
 
   // Save code blocks first (```code```)
   text = text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => {
@@ -36,6 +108,13 @@ export function convertMarkdownToHtml(text: string): string {
   text = text.replace(/`([^`]+)`/g, (_, code) => {
     inlineCodes.push(code);
     return `\x00INLINECODE${inlineCodes.length - 1}\x00`;
+  });
+
+  // Detect and save Markdown tables with rendering strategy
+  text = text.replace(/((?:^\|.+\|$\n?)+)/gm, (match) => {
+    const strategy = getTableRenderingStrategy(match);
+    tables.push({ markdown: match, strategy });
+    return `\x00TABLE${tables.length - 1}\x00`;
   });
 
   // Escape HTML entities in the remaining text
@@ -67,6 +146,103 @@ export function convertMarkdownToHtml(text: string): string {
 
   // Links: [text](url) -> <a href="url">text</a>
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  // Restore tables with three-tier rendering strategy
+  for (let i = 0; i < tables.length; i++) {
+    const table = tables[i]!;
+    const { markdown, strategy } = table;
+    const placeholder = `\x00TABLE${i}\x00`;
+
+    // Strategy 1: Simple tables → row-by-row list
+    if (strategy.type === "list") {
+      const listHtml = convertTableToList(markdown);
+      text = text.replace(placeholder, listHtml);
+      continue;
+    }
+
+    // Strategy 2: Complex tables → PNG image
+    if (strategy.type === "image" && workingDir) {
+      try {
+        const outputDir = `${workingDir}/.claude-bot/tables`;
+        const filename = `table_${Date.now()}_${i}.png`;
+        console.log(`[TABLE-RENDER] Rendering image for table ${i}, strategy: image, workingDir: ${workingDir}`);
+
+        const imagePath = await renderTableToImage(markdown, outputDir, filename);
+        console.log(`[TABLE-RENDER] Image path result: ${imagePath}`);
+
+        if (imagePath) {
+          const marker = `[SEND_FILE: ${imagePath}]`;
+          const note = `<i>📊 Table (${strategy.rowCount}×${strategy.colCount}, see image above)</i>`;
+          console.log(`[TABLE-RENDER] Inserting marker: ${marker}`);
+          text = text.replace(placeholder, `${marker}\n${note}`);
+        } else {
+          // Fallback to text if image rendering fails
+          console.warn(`[TABLE-RENDER] Image rendering returned null, falling back to text`);
+          const formattedTable = convertMarkdownTable(markdown);
+          text = text.replace(placeholder, formattedTable);
+        }
+      } catch (error) {
+        console.error("[formatting] Table image rendering failed:", error);
+        const formattedTable = convertMarkdownTable(markdown);
+        text = text.replace(placeholder, formattedTable);
+      }
+      continue;
+    }
+
+    // Check if we're falling through without workingDir
+    if (strategy.type === "image" && !workingDir) {
+      console.warn(`[TABLE-RENDER] Image strategy but no workingDir! Falling back to text.`);
+    }
+
+    // Strategy 3: Very large tables → PNG preview + CSV
+    if (strategy.type === "image_with_csv" && workingDir) {
+      try {
+        const outputDir = `${workingDir}/.claude-bot/tables`;
+        const pngFilename = `table_${Date.now()}_${i}.png`;
+        const csvFilename = `table_${Date.now()}_${i}.csv`;
+        console.log(`[TABLE-RENDER] Rendering large table ${i}, strategy: image_with_csv, workingDir: ${workingDir}`);
+
+        const [imagePath, csvPath] = await Promise.all([
+          renderTableToImage(markdown, outputDir, pngFilename, 20), // First 20 rows
+          Promise.resolve(generateTableCSV(markdown, outputDir, csvFilename)),
+        ]);
+
+        console.log(`[TABLE-RENDER] Large table results - image: ${imagePath}, csv: ${csvPath}`);
+
+        if (imagePath && csvPath) {
+          const markers = `[SEND_FILE: ${imagePath}]\n[SEND_FILE: ${csvPath}]`;
+          const note = `<i>📊 Large table (${strategy.rowCount} rows). Image shows preview, download CSV for full data.</i>`;
+          console.log(`[TABLE-RENDER] Inserting markers: ${markers}`);
+          text = text.replace(placeholder, `${markers}\n${note}`);
+        } else if (imagePath) {
+          // CSV failed, just send image
+          const marker = `[SEND_FILE: ${imagePath}]`;
+          const note = `<i>📊 Table (${strategy.rowCount}×${strategy.colCount}, see image above)</i>`;
+          console.log(`[TABLE-RENDER] CSV failed, inserting image marker only: ${marker}`);
+          text = text.replace(placeholder, `${marker}\n${note}`);
+        } else {
+          // Both failed, fallback to text
+          console.warn(`[TABLE-RENDER] Both image and CSV failed, falling back to text`);
+          const formattedTable = convertMarkdownTable(markdown);
+          text = text.replace(placeholder, formattedTable);
+        }
+      } catch (error) {
+        console.error("[formatting] Table rendering failed:", error);
+        const formattedTable = convertMarkdownTable(markdown);
+        text = text.replace(placeholder, formattedTable);
+      }
+      continue;
+    }
+
+    // Check if we're falling through without workingDir
+    if (strategy.type === "image_with_csv" && !workingDir) {
+      console.warn(`[TABLE-RENDER] Large table strategy but no workingDir! Falling back to text.`);
+    }
+
+    // Fallback: No workingDir or unknown strategy → use current monospace rendering
+    const formattedTable = convertMarkdownTable(markdown);
+    text = text.replace(placeholder, formattedTable);
+  }
 
   // Restore code blocks
   for (let i = 0; i < codeBlocks.length; i++) {
@@ -306,4 +482,59 @@ export function formatToolStatus(
   }
 
   return `${emoji} ${escapeHtml(toolName)}`;
+}
+
+/**
+ * Format context window usage as a percentage display.
+ * Returns MARKDOWN format (not HTML) so it can be converted with the rest of the message.
+ *
+ * @param modelUsage - Model usage data from SDK result event
+ * @returns Formatted string like "📊 **Context:** 45% (90K/200K tokens)" or empty string if no data
+ */
+export function formatContextUsage(
+  modelUsage: Record<string, {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    contextWindow: number;
+  }> | null
+): string {
+  if (!modelUsage || Object.keys(modelUsage).length === 0) {
+    return "";
+  }
+
+  // Get the first (and typically only) model's usage
+  const usage = Object.values(modelUsage)[0];
+  if (!usage) return "";
+
+  // IMPORTANT: Include cache read tokens in total context usage!
+  // Cache read tokens are part of the context window (previously cached conversation)
+  const usedTokens = usage.inputTokens + usage.outputTokens + (usage.cacheReadInputTokens || 0);
+  const contextWindow = usage.contextWindow;
+
+  // Calculate actual percentage (no scaling)
+  const percentage = Math.min(100, Math.round((usedTokens / contextWindow) * 100));
+
+  // Format token counts with K suffix for thousands
+  const formatTokens = (n: number): string => {
+    if (n >= 1000) {
+      return `${(n / 1000).toFixed(1)}K`;
+    }
+    return n.toString();
+  };
+
+  // Color-coded emoji based on actual percentage
+  let emoji: string;
+  if (percentage < 50) {
+    emoji = "💚"; // Green: safe
+  } else if (percentage < 70) {
+    emoji = "💛"; // Yellow: moderate
+  } else if (percentage < 85) {
+    emoji = "🧡"; // Orange: warning
+  } else {
+    emoji = "🔴"; // Red: critical
+  }
+
+  // Return markdown (** for bold), not HTML
+  return `${emoji} **Context:** ${percentage}% (${formatTokens(usedTokens)}/${formatTokens(contextWindow)} tokens)`;
 }

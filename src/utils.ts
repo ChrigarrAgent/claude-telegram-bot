@@ -186,6 +186,258 @@ export async function transcribeVoice(
   }
 }
 
+// ============== Voice Synthesis (TTS) ==============
+
+import { GOOGLE_TTS_API_KEY, TTS_MAX_CHARS } from "./config";
+import { trackTTSUsage, isTTSDisabledByUsage } from "./tts-usage";
+import { getVoiceProfile, type VoiceProfile } from "./voice-profiles";
+
+/**
+ * Synthesize text to speech using Gemini API with LLM rewrite.
+ *
+ * NEW APPROACH:
+ * 1. Takes Claude's normal output (with markdown, URLs, etc.)
+ * 2. Uses Gemini LLM to rewrite it for conversational speech
+ * 3. Translates if global language override is set
+ * 4. Generates audio from the rewritten text
+ *
+ * This way Claude doesn't need voice-specific system prompts!
+ *
+ * @param text - Claude's normal output text
+ * @param profileId - Voice profile ID (genz, speedrun, teacher, tedlasso)
+ * @returns Audio buffer or error message
+ */
+export async function synthesizeVoice(
+  text: string,
+  profileId: string = "genz"
+): Promise<Buffer | { error: string }> {
+  if (!GOOGLE_TTS_API_KEY) {
+    console.warn("[TTS] API key not configured");
+    return { error: "TTS API key not configured" };
+  }
+
+  try {
+    // Get voice profile settings
+    const profile = getVoiceProfile(profileId);
+
+    // Check for global language override
+    const { getGlobalVoiceLanguage } = await import("./global-settings");
+    const languageOverride = getGlobalVoiceLanguage();
+    const targetLanguage = languageOverride || profile.language;
+
+    console.log(`[TTS-Gemini] Using voice: ${profile.voice} (${profile.name}), language: ${targetLanguage}`);
+
+    // Truncate if too long
+    const truncatedText = text.length > TTS_MAX_CHARS
+      ? text.slice(0, TTS_MAX_CHARS) + "..."
+      : text;
+
+    // STEP 1: Use Gemini LLM to rewrite Claude's output for conversational speech
+    // This removes markdown, URLs, rewrites in conversational tone matching the profile
+    // IMPORTANT: Limit output to ~800 chars for 1-minute voice message
+    const rewritePrompt = profile.systemPrompt + `\n\nMessage to rewrite:\n\n${truncatedText}`;
+
+    console.log(`[TTS-Gemini] Step 1: Rewriting text for speech...`);
+
+    const rewriteResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GOOGLE_TTS_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: rewritePrompt }]
+          }]
+        }),
+      }
+    );
+
+    if (!rewriteResponse.ok) {
+      const errorText = await rewriteResponse.text();
+      console.error("[TTS-Gemini] Rewrite error:", rewriteResponse.status, errorText);
+      return { error: `Gemini rewrite failed: ${rewriteResponse.status}` };
+    }
+
+    const rewriteData = await rewriteResponse.json() as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{ text?: string }>
+        }
+      }>
+    };
+
+    const speechText = rewriteData.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!speechText) {
+      console.error("[TTS-Gemini] No rewritten text returned");
+      return { error: "Gemini failed to rewrite text" };
+    }
+
+    console.log(`[TTS-Gemini] Rewritten (${speechText.length} chars): ${speechText.slice(0, 100)}...`);
+
+    // STEP 2: Translate if needed (if language is not en-US)
+    let finalSpeechText = speechText;
+    if (targetLanguage && targetLanguage !== "en-US") {
+      console.log(`[TTS-Gemini] Step 2a: Translating to ${targetLanguage}...`);
+
+      const translatePrompt = `Translate this text to ${targetLanguage}. Maintain the conversational tone and style. Keep it natural for spoken audio.\n\nText to translate:\n\n${speechText}`;
+
+      const translateResponse = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GOOGLE_TTS_API_KEY,
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{ text: translatePrompt }]
+            }]
+          }),
+        }
+      );
+
+      if (!translateResponse.ok) {
+        const errorText = await translateResponse.text();
+        console.error("[TTS-Gemini] Translation error:", translateResponse.status, errorText);
+        return { error: `Translation failed: ${translateResponse.status}` };
+      }
+
+      const translateData = await translateResponse.json() as {
+        candidates?: Array<{
+          content?: {
+            parts?: Array<{ text?: string }>
+          }
+        }>
+      };
+
+      const translatedText = translateData.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!translatedText) {
+        console.error("[TTS-Gemini] No translated text returned");
+        return { error: "Translation failed" };
+      }
+
+      finalSpeechText = translatedText;
+      console.log(`[TTS-Gemini] Translated (${finalSpeechText.length} chars): ${finalSpeechText.slice(0, 100)}...`);
+    }
+
+    console.log(`[TTS-Gemini] Step 3: Generating audio from text...`);
+
+    // STEP 3: Generate TTS audio from the rewritten (and possibly translated) text
+    // Use profile-specific TTS performance instructions for personality
+    const ttsPrompt = `${profile.ttsPrompt}\n\nText to speak:\n${finalSpeechText}`;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GOOGLE_TTS_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: ttsPrompt }]
+          }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: profile.voice,
+                }
+              }
+            }
+          }
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[TTS-Gemini] TTS API error:", response.status, errorText);
+      return { error: `TTS API error: ${response.status}` };
+    }
+
+    const data = await response.json() as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{
+            inlineData?: {
+              data?: string;
+              mimeType?: string;
+            }
+          }>
+        }
+      }>
+    };
+
+    // Extract audio from Gemini response
+    const audioData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+    if (!audioData) {
+      console.error("[TTS-Gemini] Response missing audio data");
+      console.error("[TTS-Gemini] Full response:", JSON.stringify(data, null, 2));
+      return { error: "No audio data in response" };
+    }
+
+    // Track usage for analytics (even though it's free)
+    trackTTSUsage(finalSpeechText.length);
+
+    console.log(`[TTS-Gemini] ✅ Audio generated (${audioData.length} chars base64)`);
+
+    // Decode base64 to PCM buffer
+    const pcmBuffer = Buffer.from(audioData, "base64");
+    console.log(`[TTS-Gemini] Decoded PCM: ${pcmBuffer.length} bytes`);
+
+    // Convert PCM to OGG/OPUS for Telegram
+    // Gemini returns: audio/L16;codec=pcm;rate=24000 (16-bit PCM at 24kHz)
+    // Telegram needs: OGG/OPUS format
+    console.log(`[TTS-Gemini] Converting PCM to OGG/OPUS...`);
+
+    const { $ } = await import("bun");
+    const tempPcm = `/tmp/tts-${Date.now()}.pcm`;
+    const tempOgg = `/tmp/tts-${Date.now()}.ogg`;
+
+    try {
+      // Write PCM data to temp file
+      await Bun.write(tempPcm, pcmBuffer);
+
+      // Convert PCM to OGG/OPUS using ffmpeg
+      // -f s16le: 16-bit little-endian PCM
+      // -ar 24000: 24kHz sample rate
+      // -ac 1: mono audio
+      // -c:a libopus: use Opus codec
+      // -b:a 64k: 64kbps bitrate (good for voice)
+      await $`ffmpeg -y -f s16le -ar 24000 -ac 1 -i ${tempPcm} -c:a libopus -b:a 64k ${tempOgg}`.quiet();
+
+      // Read converted OGG file
+      const oggBuffer = await Bun.file(tempOgg).arrayBuffer();
+      const result = Buffer.from(oggBuffer);
+
+      console.log(`[TTS-Gemini] ✅ Converted to OGG/OPUS: ${result.length} bytes`);
+
+      // Clean up temp files
+      await $`rm -f ${tempPcm} ${tempOgg}`.quiet();
+
+      return result;
+    } catch (conversionError) {
+      console.error("[TTS-Gemini] ❌ PCM→OGG conversion failed:", conversionError);
+      // Clean up on error
+      await $`rm -f ${tempPcm} ${tempOgg}`.quiet().catch(() => {});
+      return { error: `Audio conversion failed: ${conversionError instanceof Error ? conversionError.message : String(conversionError)}` };
+    }
+  } catch (error) {
+    console.error("[TTS-Gemini] Synthesis failed:", error);
+    return { error: `TTS synthesis failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 // ============== Typing Indicator ==============
 
 export interface TypingController {
@@ -218,35 +470,36 @@ export function startTypingIndicator(ctx: Context): TypingController {
 
 // ============== Message Interrupt ==============
 
-// Import session lazily to avoid circular dependency
-let sessionModule: {
-  session: {
+/**
+ * Check for ! prefix and interrupt the given project session's running query.
+ * Accepts the actual ClaudeSession to interrupt (not the legacy global singleton).
+ */
+export async function checkInterrupt(
+  text: string,
+  targetSession?: {
     isRunning: boolean;
     stop: () => Promise<"stopped" | "pending" | false>;
     markInterrupt: () => void;
     clearStopRequested: () => void;
-  };
-} | null = null;
-
-export async function checkInterrupt(text: string): Promise<string> {
+  }
+): Promise<string> {
   if (!text || !text.startsWith("!")) {
     return text;
   }
 
-  // Lazy import to avoid circular dependency
-  if (!sessionModule) {
-    sessionModule = await import("./session");
-  }
-
   const strippedText = text.slice(1).trimStart();
 
-  if (sessionModule.session.isRunning) {
-    console.log("! prefix - interrupting current query");
-    sessionModule.session.markInterrupt();
-    await sessionModule.session.stop();
-    await Bun.sleep(100);
+  if (targetSession && targetSession.isRunning) {
+    console.log("! prefix - interrupting current project query");
+    targetSession.markInterrupt();
+    await targetSession.stop();
+    // Wait for the abort to propagate and queryLock to release
+    for (let i = 0; i < 10; i++) {
+      await Bun.sleep(100);
+      if (!targetSession.isRunning) break;
+    }
     // Clear stopRequested so the new message can proceed
-    sessionModule.session.clearStopRequested();
+    targetSession.clearStopRequested();
   }
 
   return strippedText;

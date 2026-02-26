@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# long-run: Run a command in a fully detached background process.
+#
+# Usage: long-run <command> [args...]
+#
+# Creates status/log files in /tmp/long-run/ and exits immediately.
+# The bot's ProcessMonitor picks up completions and notifies the user.
+#
+
+set -euo pipefail
+
+if [ $# -eq 0 ]; then
+  echo "Usage: long-run <command> [args...]"
+  echo "Runs the command in a detached background process."
+  exit 1
+fi
+
+# Generate unique ID: YYYYMMDD-HHMMSS-<random4hex>
+ID="$(date +%Y%m%d-%H%M%S)-$(head -c2 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+# Ensure output directory exists
+DIR="/tmp/long-run"
+mkdir -p "$DIR"
+
+STATUS_FILE="$DIR/$ID.status"
+LOG_FILE="$DIR/$ID.log"
+CWD="$(pwd)"
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Build the full command string safely via jq
+COMMAND_JSON=$(printf '%s\n' "$@" | jq -Rs '.')
+CWD_JSON=$(printf '%s' "$CWD" | jq -Rs '.')
+
+# Write initial status file
+cat > "$STATUS_FILE" <<EOF
+{
+  "id": "$ID",
+  "command": $COMMAND_JSON,
+  "cwd": $CWD_JSON,
+  "started_at": "$STARTED_AT",
+  "pid": null,
+  "status": "starting",
+  "exit_code": null
+}
+EOF
+
+# Launch the detached process via setsid
+# The inner script:
+#   1. Updates status to "running" with PID
+#   2. Runs the command, capturing stdout+stderr
+#   3. Updates status to "completed" with exit code and completed_at timestamp
+setsid bash -c '
+  STATUS_FILE="$1"; shift
+  LOG_FILE="$1"; shift
+  ID="$1"; shift
+  CWD_JSON="$1"; shift
+  COMMAND_JSON="$1"; shift
+  STARTED_AT="$1"; shift
+
+  MY_PID=$$
+
+  # Update status to running with PID
+  printf "{\"id\":\"%s\",\"command\":%s,\"cwd\":%s,\"started_at\":\"%s\",\"pid\":%d,\"status\":\"running\",\"exit_code\":null}\n" \
+    "$ID" "$COMMAND_JSON" "$CWD_JSON" "$STARTED_AT" "$MY_PID" > "$STATUS_FILE"
+
+  # Run the actual command
+  EXIT_CODE=0
+  "$@" > "$LOG_FILE" 2>&1 || EXIT_CODE=$?
+
+  # Update status to completed with timestamp
+  COMPLETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf "{\"id\":\"%s\",\"command\":%s,\"cwd\":%s,\"started_at\":\"%s\",\"completed_at\":\"%s\",\"pid\":%d,\"status\":\"completed\",\"exit_code\":%d}\n" \
+    "$ID" "$COMMAND_JSON" "$CWD_JSON" "$STARTED_AT" "$COMPLETED_AT" "$MY_PID" "$EXIT_CODE" > "$STATUS_FILE"
+
+' _ "$STATUS_FILE" "$LOG_FILE" "$ID" "$CWD_JSON" "$COMMAND_JSON" "$STARTED_AT" "$@" </dev/null >/dev/null 2>&1 &
+
+echo "Started background process: $ID"
+echo "Status: $STATUS_FILE"
+echo "Log: $LOG_FILE"

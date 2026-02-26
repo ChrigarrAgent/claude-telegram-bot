@@ -4,16 +4,15 @@
 
 import type { Context } from "grammy";
 import { unlinkSync } from "fs";
-import { session } from "../session";
 import { ALLOWED_USERS, TEMP_DIR, TRANSCRIPTION_AVAILABLE } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import {
   auditLog,
   auditLogRateLimit,
   transcribeVoice,
-  startTypingIndicator,
 } from "../utils";
-import { StreamingState, createStatusCallback } from "./streaming";
+import { getProjectAlias } from "../project-aliases";
+import { getSessionOrReply, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 /**
  * Handle incoming voice messages.
@@ -52,16 +51,17 @@ export async function handleVoice(ctx: Context): Promise<void> {
     return;
   }
 
-  // 4. Mark processing started (allows /stop to work during transcription/classification)
-  const stopProcessing = session.startProcessing();
+  // 4. Get project session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
 
-  // 5. Start typing indicator for transcription
-  const typing = startTypingIndicator(ctx);
+  // 5. Mark processing started (allows /stop to work during transcription/classification)
+  const stopProcessing = projectSession.session.startProcessing();
 
   let voicePath: string | null = null;
 
   try {
-    // 6. Download voice file
+    // 7. Download voice file
     const file = await ctx.getFile();
     const timestamp = Date.now();
     voicePath = `${TEMP_DIR}/voice_${timestamp}.ogg`;
@@ -73,7 +73,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
     const buffer = await downloadRes.arrayBuffer();
     await Bun.write(voicePath, buffer);
 
-    // 7. Transcribe
+    // 8. Transcribe
     const statusMsg = await ctx.reply("🎤 Transcribing...");
 
     const transcript = await transcribeVoice(voicePath);
@@ -87,63 +87,55 @@ export async function handleVoice(ctx: Context): Promise<void> {
       return;
     }
 
-    // 8. Show transcript (truncate display if needed - full transcript still sent to Claude)
-    const maxDisplay = 4000; // Leave room for 🎤 "" wrapper within 4096 limit
-    const displayTranscript =
-      transcript.length > maxDisplay
-        ? transcript.slice(0, maxDisplay) + "…"
-        : transcript;
+    // 9. Show transcript with project context
+    const projectAlias = getProjectAlias(projectSession.workingDir);
     await ctx.api.editMessageText(
       chatId,
       statusMsg.message_id,
-      `🎤 "${displayTranscript}"`
+      `🎤 <b>${projectAlias}</b>: "${transcript}"`,
+      { parse_mode: "HTML" }
     );
 
-    // 9. Set conversation title from transcript (if new session)
-    if (!session.isActive) {
+    // 10. Set conversation title from transcript (if new session)
+    if (!projectSession.isActive()) {
       const title =
         transcript.length > 50 ? transcript.slice(0, 47) + "..." : transcript;
-      session.conversationTitle = title;
+      projectSession.session.conversationTitle = title;
     }
 
-    // 10. Create streaming state and callback
-    const state = new StreamingState();
-    const statusCallback = createStatusCallback(ctx, state);
+    // 11. Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
 
-    // 11. Send to Claude
-    const claudeResponse = await session.sendMessageStreaming(
+    // 12. Send to Claude with retry logic
+    const { response } = await sendMessageWithRetry(
+      projectSession,
       transcript,
       username,
       userId,
-      statusCallback,
+      ctx,
       chatId,
-      ctx
+      1,
+      voiceEnabled
     );
 
+    // Update project activity
+    projectSession.updateActivity();
+
     // 12. Audit log
-    await auditLog(userId, username, "VOICE", transcript, claudeResponse);
+    await auditLog(userId, username, "VOICE", transcript, response);
   } catch (error) {
     console.error("Error processing voice:", error);
-
-    if (String(error).includes("abort") || String(error).includes("cancel")) {
-      // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
-      const wasInterrupt = session.consumeInterruptFlag();
-      if (!wasInterrupt) {
-        await ctx.reply("🛑 Query stopped.");
-      }
-    } else {
-      await ctx.reply(`❌ Error: ${String(error).slice(0, 200)}`);
-    }
+    await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
-    typing.stop();
 
     // Clean up voice file
     if (voicePath) {
       try {
         unlinkSync(voicePath);
-      } catch (error) {
-        console.debug("Failed to delete voice file:", error);
+      } catch {
+        // Ignore cleanup errors
       }
     }
   }

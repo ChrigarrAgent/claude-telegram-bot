@@ -3,16 +3,170 @@
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
-import { ALLOWED_USERS } from "../config";
+import { exec } from "child_process";
+import { promisify } from "util";
+import { sessionManager } from "../session-manager";
+import { ALLOWED_USERS, setWorkingDir, SHOW_PROJECT_HEADERS, getWorkingDir } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import {
   auditLog,
   auditLogRateLimit,
   checkInterrupt,
-  startTypingIndicator,
 } from "../utils";
-import { StreamingState, createStatusCallback } from "./streaming";
+import { getProjectAlias, getProjectByAlias } from "../project-aliases";
+import { getProjectNameForChat, sendMessageWithRetry, handleMessageError } from "../helpers";
+import { handleFreeTextQuestionResponse } from "./ask-user-question";
+
+const execAsync = promisify(exec);
+
+/**
+ * Extract context from replied-to or forwarded messages.
+ */
+function extractMessageContext(ctx: Context): string | null {
+  const msg = ctx.message;
+  if (!msg) return null;
+
+  const parts: string[] = [];
+
+  // Handle forwarded messages
+  if (msg.forward_origin || msg.forward_from || msg.forward_from_chat || msg.forward_date) {
+    let forwardSource = "unknown";
+
+    // Try to get forward source info
+    if (msg.forward_from) {
+      forwardSource = msg.forward_from.username
+        ? `@${msg.forward_from.username}`
+        : `${msg.forward_from.first_name || "User"}`;
+    } else if (msg.forward_from_chat) {
+      forwardSource = msg.forward_from_chat.title || msg.forward_from_chat.username || "Chat";
+    } else if ((msg.forward_origin as any)?.sender_user) {
+      const sender = (msg.forward_origin as any).sender_user;
+      forwardSource = sender.username ? `@${sender.username}` : sender.first_name || "User";
+    } else if ((msg.forward_origin as any)?.chat) {
+      forwardSource = (msg.forward_origin as any).chat.title || "Chat";
+    }
+
+    // The forwarded content IS the message text itself, so we note the source
+    parts.push(`[Forwarded from ${forwardSource}]`);
+  }
+
+  // Handle reply to another message
+  const replyTo = msg.reply_to_message;
+  if (replyTo) {
+    const replyFrom = replyTo.from?.username
+      ? `@${replyTo.from.username}`
+      : replyTo.from?.first_name || "Someone";
+
+    // Get the content of the replied message
+    let replyContent = "";
+    if (replyTo.text) {
+      replyContent = replyTo.text;
+    } else if (replyTo.caption) {
+      replyContent = `[Media] ${replyTo.caption}`;
+    } else if (replyTo.photo) {
+      replyContent = "[Photo]";
+    } else if (replyTo.document) {
+      replyContent = `[Document: ${replyTo.document.file_name || "file"}]`;
+    } else if (replyTo.voice) {
+      replyContent = "[Voice message]";
+    } else {
+      replyContent = "[Message]";
+    }
+
+    // Truncate if too long
+    if (replyContent.length > 500) {
+      replyContent = replyContent.slice(0, 497) + "...";
+    }
+
+    parts.push(`[Replying to ${replyFrom}]: ${replyContent}`);
+  }
+
+  return parts.length > 0 ? parts.join("\n") : null;
+}
+
+/**
+ * Handle pending GitHub clone flow.
+ * Called when user sends a repo name/URL after clicking "Clone from GitHub".
+ */
+async function handlePendingClone(ctx: Context, input: string, pending: {
+  projectName: string;
+  projectPath: string;
+  chatId: number | undefined;
+}): Promise<void> {
+
+  // Parse repo input - accept various formats:
+  // - username/repo
+  // - https://github.com/username/repo
+  // - https://github.com/username/repo.git
+  // - git@github.com:username/repo.git
+  let repo = input.trim();
+
+  // Extract repo from full URL
+  if (repo.includes("github.com")) {
+    const match = repo.match(/github\.com[/:]([\w.-]+\/[\w.-]+)/);
+    if (match) {
+      repo = match[1]!.replace(/\.git$/, "");
+    }
+  }
+
+  // Validate format
+  if (!repo.match(/^[\w.-]+\/[\w.-]+$/)) {
+    await ctx.reply(
+      `❌ Invalid repository format: <code>${input}</code>\n\n` +
+        `Expected: <code>username/repo</code> or GitHub URL`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Start cloning
+  const statusMsg = await ctx.reply(
+    `🔄 Cloning <code>${repo}</code>...`,
+    { parse_mode: "HTML" }
+  );
+
+  try {
+    // Use gh CLI to clone (handles auth automatically)
+    const { stdout, stderr } = await execAsync(
+      `gh repo clone ${repo} "${pending.projectPath}"`,
+      { timeout: 120000 } // 2 minute timeout
+    );
+
+    console.log(`Clone output: ${stdout}`);
+    if (stderr) console.log(`Clone stderr: ${stderr}`);
+
+    // Switch to the cloned project
+    setWorkingDir(pending.projectPath);
+    sessionManager.setCurrentProject(pending.projectName);
+    if (pending.chatId) {
+      sessionManager.setLastUsed(pending.chatId, pending.projectName);
+    }
+
+    // Note: We don't kill any session here because:
+    // 1. This is a NEW project, so there's no existing session to kill
+    // 2. Killing the global session would affect other projects
+
+    // Update status message
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      statusMsg.message_id,
+      `✅ <b>Cloned:</b> <code>${repo}</code>\n\n` +
+        `📁 Path: <code>${pending.projectPath}</code>\n\n` +
+        `Next message starts fresh in this project.`,
+      { parse_mode: "HTML" }
+    );
+  } catch (error) {
+    console.error(`Clone failed:`, error);
+    const errorMsg = String(error).slice(0, 200);
+
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      statusMsg.message_id,
+      `❌ <b>Clone failed:</b>\n<code>${errorMsg}</code>`,
+      { parse_mode: "HTML" }
+    );
+  }
+}
 
 /**
  * Handle incoming text messages.
@@ -21,10 +175,20 @@ export async function handleText(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
   let message = ctx.message?.text;
+
+  // Debug: log every incoming text message
+  console.log(`[TEXT] Received: "${message?.slice(0, 50)}..." from ${username} (chat ${chatId})`);
 
   if (!userId || !message || !chatId) {
     return;
+  }
+
+  // Extract context from reply/forward
+  const messageContext = extractMessageContext(ctx);
+  if (messageContext) {
+    message = `${messageContext}\n\n[Your message]: ${message}`;
   }
 
   // 1. Authorization check
@@ -33,8 +197,220 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
-  // 2. Check for interrupt prefix
-  message = await checkInterrupt(message);
+  // 1.2. Handle /verify command in text handler (workaround for grammY command routing issue)
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (isGroup && message.startsWith('/verify ')) {
+    console.log(`[TEXT-VERIFY] Handling /verify command in text handler`);
+
+    // Extract code from /verify command
+    const verifyMatch = message.match(/^\/verify\s+(\d{6})\s*$/);
+    if (verifyMatch) {
+      const code = verifyMatch[1]!;
+      const pendingLink = sessionManager.getPendingGroupLink(chatId);
+
+      console.log(`[VERIFY] Received code ${code} in group ${chatId} via /verify command`);
+      console.log(`[VERIFY] Pending link:`, pendingLink ? `exists for project ${pendingLink.projectName}` : 'not found');
+
+      if (pendingLink) {
+        console.log(`[VERIFY] Stored code: ${pendingLink.verificationCode}, received code: ${code}, match: ${pendingLink.verificationCode === code}`);
+      }
+
+      if (pendingLink && pendingLink.verificationCode === code) {
+        // Valid code - complete the link
+        console.log(`[VERIFY] ✅ Code match! Linking group ${chatId} to project ${pendingLink.projectName}`);
+
+        const { setGroupLink } = await import("../group-links");
+        setGroupLink(chatId, {
+          projectName: pendingLink.projectName,
+          projectPath: pendingLink.projectPath,
+          linkedAt: new Date().toISOString(),
+          linkedBy: userId,
+          groupTitle: ctx.chat?.title || "Unknown Group",
+        });
+
+        // Clear pending link
+        sessionManager.clearPendingGroupLink(chatId);
+
+        // Set this group as the last-used project for this chat
+        sessionManager.setLastUsed(chatId, pendingLink.projectName);
+
+        console.log(`[VERIFY] ✅ Link complete! Group ${chatId} → ${pendingLink.projectName}`);
+
+        await ctx.reply(
+          `✅ <b>Group successfully linked!</b>\n\n` +
+          `Project: <code>${pendingLink.projectName}</code>\n\n` +
+          `You can now send messages and files to Claude in this group.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else if (pendingLink) {
+        // Invalid code
+        await ctx.reply(
+          `❌ Invalid verification code.\n\n` +
+          `The code in your DM is different. Please check and try again.\n\n` +
+          `<i>Use /link again if the code expired.</i>`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else {
+        // No pending link
+        await ctx.reply(
+          `⚠️ No pending link verification for this group.\n\n` +
+          `Use <code>/link &lt;project-name&gt;</code> to start the linking process.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+    } else {
+      await ctx.reply(
+        "❌ Invalid format. Usage: <code>/verify 123456</code>",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+  }
+
+  // 1.3. Check for group link verification code (groups only) - legacy 6-digit code only
+  if (isGroup) {
+    // Check if this is a verification code (6 digits)
+    const codeMatch = message.match(/^\s*(\d{6})\s*$/);
+    if (codeMatch) {
+      const code = codeMatch[1]!;
+      const pendingLink = sessionManager.getPendingGroupLink(chatId);
+
+      console.log(`[VERIFY] Received code ${code} in group ${chatId}`);
+      console.log(`[VERIFY] Pending link:`, pendingLink ? `exists for project ${pendingLink.projectName}` : 'not found');
+
+      if (pendingLink) {
+        console.log(`[VERIFY] Stored code: ${pendingLink.verificationCode}, received code: ${code}, match: ${pendingLink.verificationCode === code}`);
+      }
+
+      if (pendingLink && pendingLink.verificationCode === code) {
+        // Valid code - complete the link
+        console.log(`[VERIFY] ✅ Code match! Linking group ${chatId} to project ${pendingLink.projectName}`);
+
+        const { setGroupLink } = await import("../group-links");
+        setGroupLink(chatId, {
+          projectName: pendingLink.projectName,
+          projectPath: pendingLink.projectPath,
+          linkedAt: new Date().toISOString(),
+          linkedBy: userId,
+          groupTitle: pendingLink.groupTitle,
+        });
+
+        // Clear pending link
+        sessionManager.clearPendingGroupLink(chatId);
+
+        // Set this group as the last-used project for this chat
+        sessionManager.setLastUsed(chatId, pendingLink.projectName);
+
+        console.log(`[VERIFY] ✅ Link complete! Group ${chatId} → ${pendingLink.projectName}`);
+
+        await ctx.reply(
+          `✅ <b>Group successfully linked!</b>\n\n` +
+          `Project: <code>${pendingLink.projectName}</code>\n\n` +
+          `You can now send messages and files to Claude in this group.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else if (pendingLink) {
+        // Invalid code
+        await ctx.reply(
+          `❌ Invalid verification code.\n\n` +
+          `The code sent to your DM is different. Please check and try again.\n\n` +
+          `<i>Use /link again if the code expired.</i>`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      } else {
+        // No pending link for this group
+        await ctx.reply(
+          `⚠️ No pending link verification for this group.\n\n` +
+          `Use <code>/link &lt;project-name&gt;</code> to start the linking process.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+    }
+
+    // Clean up expired pending links periodically
+    sessionManager.cleanupExpiredGroupLinks();
+  }
+
+  // 1.4. Parse @project syntax for direct project routing
+  // Format: @projectname message (routes message to that project)
+  let targetProjectFromAtSyntax: string | null = null;
+  const atMatch = message.match(/^@(\S+)\s+(.+)$/s);
+
+  if (atMatch) {
+    const [, projectAlias, remainingMessage] = atMatch;
+
+    // Check if this alias exists
+    const projectPath = getProjectByAlias(projectAlias!);
+    console.log(`[@PROJECT] Parsed alias: "${projectAlias}", resolved path: ${projectPath}`);
+    if (projectPath) {
+      // IMPORTANT: Use the ALIAS for session tracking, not the folder name!
+      // This ensures consistency - the alias is what resolveProjectPath() can look up.
+      const projName = projectAlias!.toLowerCase();
+      targetProjectFromAtSyntax = projName;
+      message = remainingMessage!;
+
+      // Switch to this project
+      setWorkingDir(projectPath);
+      sessionManager.setCurrentProject(projName);
+      sessionManager.setLastUsed(chatId, projName);
+      console.log(`[@PROJECT] Set working dir to: ${projectPath}, projName: ${projName} (alias)`);
+    } else {
+      // Unknown project alias - warn user and continue with original message
+      await ctx.reply(
+        `⚠️ Unknown project: <code>@${projectAlias}</code>\n\n` +
+          `Use <code>/projects</code> to see available projects.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+  }
+
+  // 1.5. Determine target project (from @-syntax, last-used, or default)
+  const projectName = targetProjectFromAtSyntax || getProjectNameForChat(chatId, chatType);
+
+  // Check if group is unlinked
+  if (!projectName) {
+    await ctx.reply(
+      "⚠️ This group is not linked to any project.\n\n" +
+      "Use <code>/link &lt;project-name&gt;</code> to link it.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Get or create project session
+  const projectSession = await sessionManager.getOrCreateSession(projectName);
+
+  // CRITICAL: Track last-used project IMMEDIATELY so subsequent messages route correctly
+  // This ensures that even if this message fails, the next message knows which project to use
+  sessionManager.setLastUsed(chatId, projectName);
+
+  // 1.6. Handle pending clone flow (stored per-chat in sessionManager)
+  const pendingClone = sessionManager.getPendingClone(chatId);
+  if (pendingClone) {
+    sessionManager.clearPendingClone(chatId);
+    await handlePendingClone(ctx, message, pendingClone);
+    return;
+  }
+
+  // 1.7. Handle pending AskUserQuestion free text response
+  const pendingQuestion = sessionManager.getPendingQuestion(chatId, projectName);
+  if (pendingQuestion?.awaitingFreeText) {
+    // Handle the free text response (updates UI)
+    await handleFreeTextQuestionResponse(ctx, message, pendingQuestion);
+    // Continue to send the text to Claude (don't return early)
+    // The message will be sent as normal below
+  }
+
+  // 2. Check for interrupt prefix (per-project)
+  // Pass the actual project session so ! targets the right running query
+  message = await checkInterrupt(message, projectSession.session);
   if (!message.trim()) {
     return;
   }
@@ -49,88 +425,49 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
-  // 4. Store message for retry
-  session.lastMessage = message;
+  // 4. Store message for retry (on project session)
+  projectSession.session.lastMessage = message;
 
   // 5. Set conversation title from first message (if new session)
-  if (!session.isActive) {
+  if (!projectSession.isActive()) {
     // Truncate title to ~50 chars
     const title =
       message.length > 50 ? message.slice(0, 47) + "..." : message;
-    session.conversationTitle = title;
+    projectSession.session.conversationTitle = title;
   }
 
-  // 6. Mark processing started
-  const stopProcessing = session.startProcessing();
+  // 6. Project header removed - project name is shown on every message instead
 
-  // 7. Start typing indicator
-  const typing = startTypingIndicator(ctx);
+  // 7. Mark processing started (on project session)
+  const stopProcessing = projectSession.session.startProcessing();
 
-  // 8. Create streaming state and callback
-  let state = new StreamingState();
-  let statusCallback = createStatusCallback(ctx, state);
+  try {
+    // 8. Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
 
-  // 9. Send to Claude with retry logic for crashes
-  const MAX_RETRIES = 1;
+    // 9. Send to Claude with retry logic
+    const { response } = await sendMessageWithRetry(
+      projectSession,
+      message,
+      username,
+      userId,
+      ctx,
+      chatId,
+      1,
+      voiceEnabled
+    );
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const response = await session.sendMessageStreaming(
-        message,
-        username,
-        userId,
-        statusCallback,
-        chatId,
-        ctx
-      );
+    // 10. Update project activity (lastUsed already set above)
+    projectSession.updateActivity();
 
-      // 10. Audit log
-      await auditLog(userId, username, "TEXT", message, response);
-      break; // Success - exit retry loop
-    } catch (error) {
-      const errorStr = String(error);
-      const isClaudeCodeCrash = errorStr.includes("exited with code");
-
-      // Clean up any partial messages from this attempt
-      for (const toolMsg of state.toolMessages) {
-        try {
-          await ctx.api.deleteMessage(toolMsg.chat.id, toolMsg.message_id);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
-
-      // Retry on Claude Code crash (not user cancellation)
-      if (isClaudeCodeCrash && attempt < MAX_RETRIES) {
-        console.log(
-          `Claude Code crashed, retrying (attempt ${attempt + 2}/${MAX_RETRIES + 1})...`
-        );
-        await session.kill(); // Clear corrupted session
-        await ctx.reply(`⚠️ Claude crashed, retrying...`);
-        // Reset state for retry
-        state = new StreamingState();
-        statusCallback = createStatusCallback(ctx, state);
-        continue;
-      }
-
-      // Final attempt failed or non-retryable error
-      console.error("Error processing message:", error);
-
-      // Check if it was a cancellation
-      if (errorStr.includes("abort") || errorStr.includes("cancel")) {
-        // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
-        const wasInterrupt = session.consumeInterruptFlag();
-        if (!wasInterrupt) {
-          await ctx.reply("🛑 Query stopped.");
-        }
-      } else {
-        await ctx.reply(`❌ Error: ${errorStr.slice(0, 200)}`);
-      }
-      break; // Exit loop after handling error
-    }
+    // 10. Audit log
+    await auditLog(userId, username, "TEXT", message, response);
+  } catch (error) {
+    console.error(`Error processing message for ${projectName}:`, error);
+    await handleMessageError(ctx, error, projectSession);
+  } finally {
+    // 11. Cleanup
+    stopProcessing();
   }
-
-  // 11. Cleanup
-  stopProcessing();
-  typing.stop();
 }

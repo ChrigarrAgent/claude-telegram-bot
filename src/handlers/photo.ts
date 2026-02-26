@@ -5,12 +5,11 @@
  */
 
 import type { Context } from "grammy";
-import { session } from "../session";
 import { ALLOWED_USERS, TEMP_DIR } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
-import { auditLog, auditLogRateLimit, startTypingIndicator } from "../utils";
-import { StreamingState, createStatusCallback } from "./streaming";
-import { createMediaGroupBuffer, handleProcessingError } from "./media-group";
+import { auditLog, auditLogRateLimit } from "../utils";
+import { createMediaGroupBuffer } from "./media-group";
+import { getSessionOrReply, sendMessageWithRetry, handleMessageError } from "../helpers";
 
 // Create photo-specific media group buffer
 const photoBuffer = createMediaGroupBuffer({
@@ -53,11 +52,15 @@ async function processPhotos(
   photoPaths: string[],
   caption: string | undefined,
   userId: number,
-  username: string,
-  chatId: number
+  username: string
 ): Promise<void> {
-  // Mark processing started
-  const stopProcessing = session.startProcessing();
+  // Get session (handles unlinked groups)
+  const projectSession = await getSessionOrReply(ctx);
+  if (!projectSession) return;
+
+  const chatId = ctx.chat?.id!;
+
+  const stopProcessing = projectSession.session.startProcessing();
 
   // Build prompt
   let prompt: string;
@@ -73,36 +76,35 @@ async function processPhotos(
   }
 
   // Set conversation title (if new session)
-  if (!session.isActive) {
+  if (!projectSession.isActive()) {
     const rawTitle = caption || "[Foto]";
     const title =
       rawTitle.length > 50 ? rawTitle.slice(0, 47) + "..." : rawTitle;
-    session.conversationTitle = title;
+    projectSession.session.conversationTitle = title;
   }
 
-  // Start typing
-  const typing = startTypingIndicator(ctx);
-
-  // Create streaming state
-  const state = new StreamingState();
-  const statusCallback = createStatusCallback(ctx, state);
-
   try {
-    const response = await session.sendMessageStreaming(
+    // Get voice mode state for this chat
+    const { getVoiceMode } = await import("../chat-settings");
+    const voiceEnabled = getVoiceMode(chatId);
+
+    const { response } = await sendMessageWithRetry(
+      projectSession,
       prompt,
       username,
       userId,
-      statusCallback,
+      ctx,
       chatId,
-      ctx
+      1,
+      voiceEnabled
     );
 
+    projectSession.updateActivity();
     await auditLog(userId, username, "PHOTO", prompt, response);
   } catch (error) {
-    await handleProcessingError(ctx, error, state.toolMessages);
+    await handleMessageError(ctx, error, projectSession);
   } finally {
     stopProcessing();
-    typing.stop();
   }
 }
 
@@ -113,6 +115,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   const username = ctx.from?.username || "unknown";
   const chatId = ctx.chat?.id;
+  const chatType = ctx.chat?.type;
   const mediaGroupId = ctx.message?.media_group_id;
 
   if (!userId || !chatId) {
@@ -173,8 +176,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
       [photoPath],
       ctx.message?.caption,
       userId,
-      username,
-      chatId
+      username
     );
 
     // Clean up status message
