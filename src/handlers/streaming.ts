@@ -16,6 +16,59 @@ import {
   STREAMING_THROTTLE_MS,
   BUTTON_LABEL_MAX_LENGTH,
 } from "../config";
+import { parseFileSendMarkers, sendFile, sendFileViaApi } from "../file-sender";
+
+// ============== Per-Chat Edit Batching ==============
+// Tracks recent editMessageText calls per chat. When approaching Telegram's
+// rate limit (~20/min), queues edits and flushes them in batches so nothing
+// gets lost — the batch just sends one edit containing all accumulated content.
+
+const RATE_WINDOW_MS = 60_000;
+const MAX_EDITS_PER_WINDOW = 15;
+const BATCH_FLUSH_MS = 3_000;
+
+const recentEdits = new Map<number, number[]>();
+const pendingFlush = new Map<number, Timer>();
+
+function countRecentEdits(chatId: number): number {
+  const now = Date.now();
+  const timestamps = (recentEdits.get(chatId) || []).filter(
+    (t) => now - t < RATE_WINDOW_MS
+  );
+  recentEdits.set(chatId, timestamps);
+  return timestamps.length;
+}
+
+function recordEdit(chatId: number): void {
+  const timestamps = recentEdits.get(chatId) || [];
+  timestamps.push(Date.now());
+  recentEdits.set(chatId, timestamps);
+}
+
+/**
+ * Schedule a batched flush for a chat. When the timer fires it calls editFn
+ * which rebuilds from the full accumulated state, so no content is lost.
+ * If another flush is scheduled before the timer fires, the old one is
+ * replaced (the newer editFn captures the latest state).
+ */
+function scheduleFlush(chatId: number, editFn: () => Promise<void>): void {
+  const existing = pendingFlush.get(chatId);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    pendingFlush.delete(chatId);
+    try {
+      await editFn();
+      recordEdit(chatId);
+    } catch (error: any) {
+      if (!error?.description?.includes("message is not modified")) {
+        console.warn("Failed to update working message (batched):", error?.description || error);
+      }
+    }
+  }, BATCH_FLUSH_MS);
+
+  pendingFlush.set(chatId, timer);
+}
 
 /**
  * Send a long message, splitting into multiple messages if needed.
@@ -24,9 +77,10 @@ import {
 async function sendLongMessage(
   ctx: Context,
   text: string,
-  projectAlias: string
+  projectAlias: string,
+  workingDir?: string
 ): Promise<void> {
-  const htmlContent = convertMarkdownToHtml(text);
+  const htmlContent = await convertMarkdownToHtml(text, workingDir);
   const prefix = `<b>${projectAlias}:</b> `;
   const formatted = prefix + htmlContent;
 
@@ -106,7 +160,7 @@ async function sendLongMessage(
     const partIndicator = chunks.length > 1 ? ` <i>(${i + 1}/${chunks.length})</i>` : "";
 
     try {
-      const htmlChunk = convertMarkdownToHtml(chunk);
+      const htmlChunk = await convertMarkdownToHtml(chunk);
       await ctx.reply(chunkPrefix + htmlChunk + partIndicator, { parse_mode: "HTML" });
     } catch (htmlError) {
       // Fallback to escaped text
@@ -293,7 +347,8 @@ export function createStatusCallback(
   ctx: Context,
   state: StreamingState,
   projectAlias: string = "default",
-  voiceEnabled: boolean = false
+  voiceEnabled: boolean = false,
+  workingDir?: string
 ): StatusCallback {
   return async (statusType: StatusType, content: string, segmentId?: number) => {
     try {
@@ -343,11 +398,51 @@ export function createStatusCallback(
         // Then send final answer as separate clean message(s)
         if (state.finalTextSegments.length > 0) {
           const finalText = state.finalTextSegments.join("\n\n");
-          await sendLongMessage(ctx, finalText, projectAlias);
 
-          // Voice mode - synthesize and send voice message
-          if (voiceEnabled) {
-            await sendVoiceMessage(ctx, finalText);
+          // IMPORTANT: Convert markdown to HTML FIRST (this inserts table file markers)
+          const htmlText = await convertMarkdownToHtml(finalText, workingDir);
+
+          // NOW check for file send markers (after markdown conversion)
+          const { cleanText, filePaths } = parseFileSendMarkers(htmlText);
+          console.log(`[FILE-SEND] Parsed ${filePaths.length} file markers, workingDir: ${workingDir}`);
+          if (filePaths.length > 0) {
+            console.log(`[FILE-SEND] Files to send:`, filePaths);
+          }
+
+          // Send files if requested and working directory is available
+          if (filePaths.length > 0 && workingDir) {
+            for (const filePath of filePaths) {
+              console.log(`[FILE-SEND] Sending file: ${filePath}`);
+              await sendFile(ctx, filePath, workingDir);
+            }
+          } else if (filePaths.length > 0 && !workingDir) {
+            console.warn(`[FILE-SEND] Files requested but no workingDir available!`);
+          }
+
+          // Send cleaned text if there's any content left after removing markers
+          if (cleanText.trim().length > 0) {
+            // Send the already-converted HTML (don't convert again in sendLongMessage)
+            const prefix = `<b>${projectAlias}:</b> `;
+            const formatted = prefix + cleanText;
+
+            // If it fits in one message, send it
+            if (formatted.length <= TELEGRAM_SAFE_LIMIT) {
+              try {
+                await ctx.reply(formatted, { parse_mode: "HTML" });
+              } catch (htmlError: any) {
+                // Fallback to escaped text
+                const escaped = escapeHtml(cleanText);
+                await ctx.reply(prefix + escaped, { parse_mode: "HTML" });
+              }
+            } else {
+              // Need to split - use sendLongMessage but pass already-converted HTML
+              await sendLongMessage(ctx, cleanText, projectAlias, workingDir);
+            }
+
+            // Voice mode - synthesize and send voice message
+            if (voiceEnabled) {
+              await sendVoiceMessage(ctx, cleanText);
+            }
           }
         }
       }
@@ -359,6 +454,8 @@ export function createStatusCallback(
 
 /**
  * Helper function to update the working message with accumulated content.
+ * Sends immediately when under the rate limit, otherwise queues a batched
+ * flush so all accumulated content is delivered (nothing lost).
  */
 async function updateWorkingMessage(
   ctx: Context,
@@ -367,48 +464,62 @@ async function updateWorkingMessage(
 ): Promise<void> {
   if (!state.workingMessage) return;
 
+  const chatId = state.workingMessage.chat.id;
+  const messageId = state.workingMessage.message_id;
+
+  const doEdit = async () => {
+    const truncated = buildWorkingContent(state, projectAlias);
+    await ctx.api.editMessageText(chatId, messageId, truncated, {
+      parse_mode: "HTML",
+    });
+    state.lastEditTime = Date.now();
+  };
+
+  if (countRecentEdits(chatId) < MAX_EDITS_PER_WINDOW) {
+    try {
+      await doEdit();
+      recordEdit(chatId);
+    } catch (error: any) {
+      if (!error?.description?.includes("message is not modified")) {
+        console.warn("Failed to update working message:", error?.description || error);
+      }
+    }
+  } else {
+    // At the limit — queue a flush that will send all accumulated content
+    scheduleFlush(chatId, doEdit);
+  }
+}
+
+/**
+ * Build truncated working message content from accumulated state.
+ */
+function buildWorkingContent(
+  state: StreamingState,
+  projectAlias: string
+): string {
   const content = state.workingContent.join("\n");
   const fullMessage = `🔄 <b>${projectAlias}:</b>\n${content}`;
 
-  // Truncate if too long (Telegram limit) - keep recent items
-  let truncated = fullMessage;
-  if (fullMessage.length > TELEGRAM_MESSAGE_LIMIT) {
-    // Keep header and last items (most recent progress)
-    const header = `🔄 <b>${projectAlias}:</b>\n<i>... earlier progress truncated ...</i>\n`;
-    const availableSpace = TELEGRAM_MESSAGE_LIMIT - header.length - 50;
+  if (fullMessage.length <= TELEGRAM_MESSAGE_LIMIT) return fullMessage;
 
-    // Take last N items that fit
-    const items = state.workingContent.slice();
-    let kept: string[] = [];
-    let totalLen = 0;
+  const header = `🔄 <b>${projectAlias}:</b>\n<i>... earlier progress truncated ...</i>\n`;
+  const availableSpace = TELEGRAM_MESSAGE_LIMIT - header.length - 50;
 
-    for (let i = items.length - 1; i >= 0 && totalLen < availableSpace; i--) {
-      const item = items[i]!;
-      if (totalLen + item.length + 1 <= availableSpace) {
-        kept.unshift(item);
-        totalLen += item.length + 1;
-      } else {
-        break;
-      }
-    }
+  const items = state.workingContent.slice();
+  let kept: string[] = [];
+  let totalLen = 0;
 
-    truncated = header + kept.join("\n");
-  }
-
-  try {
-    await ctx.api.editMessageText(
-      state.workingMessage.chat.id,
-      state.workingMessage.message_id,
-      truncated,
-      { parse_mode: "HTML" }
-    );
-    state.lastEditTime = Date.now();
-  } catch (error: any) {
-    // Don't log "message is not modified" errors - that's expected
-    if (!error?.description?.includes("message is not modified")) {
-      console.warn("Failed to update working message:", error?.description || error);
+  for (let i = items.length - 1; i >= 0 && totalLen < availableSpace; i--) {
+    const item = items[i]!;
+    if (totalLen + item.length + 1 <= availableSpace) {
+      kept.unshift(item);
+      totalLen += item.length + 1;
+    } else {
+      break;
     }
   }
+
+  return header + kept.join("\n");
 }
 
 /**
@@ -418,9 +529,10 @@ async function sendLongMessageViaApi(
   api: Api,
   chatId: number,
   text: string,
-  projectAlias: string
+  projectAlias: string,
+  workingDir?: string
 ): Promise<void> {
-  const htmlContent = convertMarkdownToHtml(text);
+  const htmlContent = await convertMarkdownToHtml(text, workingDir);
   const prefix = `<b>${projectAlias}:</b> `;
   const formatted = prefix + htmlContent;
 
@@ -491,7 +603,7 @@ async function sendLongMessageViaApi(
     const partIndicator = chunks.length > 1 ? ` <i>(${i + 1}/${chunks.length})</i>` : "";
 
     try {
-      const htmlChunk = convertMarkdownToHtml(chunk);
+      const htmlChunk = await convertMarkdownToHtml(chunk);
       await api.sendMessage(chatId, chunkPrefix + htmlChunk + partIndicator, { parse_mode: "HTML" });
     } catch (htmlError) {
       const escaped = escapeHtml(chunk);
@@ -514,7 +626,9 @@ export function createBotApiStatusCallback(
   api: Api,
   chatId: number,
   projectAlias: string = "default",
-  voiceEnabled: boolean = false
+  voiceEnabled: boolean = false,
+  projectName?: string,
+  workingDir?: string
 ): StatusCallback {
   const state = new StreamingState();
 
@@ -552,11 +666,51 @@ export function createBotApiStatusCallback(
 
         if (state.finalTextSegments.length > 0) {
           const finalText = state.finalTextSegments.join("\n\n");
-          await sendLongMessageViaApi(api, chatId, finalText, projectAlias);
 
-          // Voice mode - synthesize and send voice message
-          if (voiceEnabled) {
-            await sendVoiceMessageViaApi(api, chatId, finalText);
+          // IMPORTANT: Convert markdown to HTML FIRST (this inserts table file markers)
+          const htmlText = await convertMarkdownToHtml(finalText, workingDir);
+
+          // NOW check for file send markers (after markdown conversion)
+          const { cleanText, filePaths } = parseFileSendMarkers(htmlText);
+          console.log(`[FILE-SEND] (API) Parsed ${filePaths.length} file markers, workingDir: ${workingDir}`);
+          if (filePaths.length > 0) {
+            console.log(`[FILE-SEND] (API) Files to send:`, filePaths);
+          }
+
+          // Send files if requested and working directory is available
+          if (filePaths.length > 0 && workingDir) {
+            for (const filePath of filePaths) {
+              console.log(`[FILE-SEND] (API) Sending file: ${filePath}`);
+              await sendFileViaApi(api, chatId, filePath, workingDir);
+            }
+          } else if (filePaths.length > 0 && !workingDir) {
+            console.warn(`[FILE-SEND] (API) Files requested but no workingDir available!`);
+          }
+
+          // Send cleaned text if there's any content left after removing markers
+          if (cleanText.trim().length > 0) {
+            // Send the already-converted HTML (don't convert again in sendLongMessageViaApi)
+            const prefix = `<b>${projectAlias}:</b> `;
+            const formatted = prefix + cleanText;
+
+            // If it fits in one message, send it
+            if (formatted.length <= TELEGRAM_SAFE_LIMIT) {
+              try {
+                await api.sendMessage(chatId, formatted, { parse_mode: "HTML" });
+              } catch (htmlError: any) {
+                // Fallback to escaped text
+                const escaped = escapeHtml(cleanText);
+                await api.sendMessage(chatId, prefix + escaped, { parse_mode: "HTML" });
+              }
+            } else {
+              // Need to split - use sendLongMessageViaApi but pass already-converted HTML
+              await sendLongMessageViaApi(api, chatId, cleanText, projectAlias, workingDir);
+            }
+
+            // Voice mode - synthesize and send voice message
+            if (voiceEnabled) {
+              await sendVoiceMessageViaApi(api, chatId, cleanText);
+            }
           }
         }
       }
@@ -568,6 +722,7 @@ export function createBotApiStatusCallback(
 
 /**
  * Helper to update the working message via Bot API (no ctx needed).
+ * Same batching logic as updateWorkingMessage.
  */
 async function updateWorkingMessageViaApi(
   api: Api,
@@ -576,44 +731,27 @@ async function updateWorkingMessageViaApi(
   projectAlias: string
 ): Promise<void> {
   if (!state.workingMessage) return;
+  const messageId = state.workingMessage.message_id;
 
-  const content = state.workingContent.join("\n");
-  const fullMessage = `🔄 <b>${projectAlias}:</b>\n${content}`;
+  const doEdit = async () => {
+    const truncated = buildWorkingContent(state, projectAlias);
+    await api.editMessageText(chatId, messageId, truncated, {
+      parse_mode: "HTML",
+    });
+    state.lastEditTime = Date.now();
+  };
 
-  let truncated = fullMessage;
-  if (fullMessage.length > TELEGRAM_MESSAGE_LIMIT) {
-    const header = `🔄 <b>${projectAlias}:</b>\n<i>... earlier progress truncated ...</i>\n`;
-    const availableSpace = TELEGRAM_MESSAGE_LIMIT - header.length - 50;
-
-    const items = state.workingContent.slice();
-    let kept: string[] = [];
-    let totalLen = 0;
-
-    for (let i = items.length - 1; i >= 0 && totalLen < availableSpace; i--) {
-      const item = items[i]!;
-      if (totalLen + item.length + 1 <= availableSpace) {
-        kept.unshift(item);
-        totalLen += item.length + 1;
-      } else {
-        break;
+  if (countRecentEdits(chatId) < MAX_EDITS_PER_WINDOW) {
+    try {
+      await doEdit();
+      recordEdit(chatId);
+    } catch (error: any) {
+      if (!error?.description?.includes("message is not modified")) {
+        console.warn("Failed to update working message:", error?.description || error);
       }
     }
-
-    truncated = header + kept.join("\n");
-  }
-
-  try {
-    await api.editMessageText(
-      chatId,
-      state.workingMessage.message_id,
-      truncated,
-      { parse_mode: "HTML" }
-    );
-    state.lastEditTime = Date.now();
-  } catch (error: any) {
-    if (!error?.description?.includes("message is not modified")) {
-      console.warn("Failed to update working message:", error?.description || error);
-    }
+  } else {
+    scheduleFlush(chatId, doEdit);
   }
 }
 
@@ -651,7 +789,7 @@ function createLegacyStatusCallback(
               ? content.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
               : content;
           // Convert markdown to HTML first
-          const htmlContent = convertMarkdownToHtml(display);
+          const htmlContent = await convertMarkdownToHtml(display);
           // Then add project prefix (won't be escaped)
           const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
           try {
@@ -677,7 +815,7 @@ function createLegacyStatusCallback(
               ? content.slice(0, TELEGRAM_SAFE_LIMIT) + "..."
               : content;
           // Convert markdown to HTML first
-          const htmlContent = convertMarkdownToHtml(display);
+          const htmlContent = await convertMarkdownToHtml(display);
           // Then add project prefix (won't be escaped)
           const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
           // Skip if content unchanged
@@ -717,7 +855,7 @@ function createLegacyStatusCallback(
         if (state.textMessages.has(segmentId) && content) {
           const msg = state.textMessages.get(segmentId)!;
           // Convert markdown to HTML first
-          const htmlContent = convertMarkdownToHtml(content);
+          const htmlContent = await convertMarkdownToHtml(content);
           // Then add project prefix (won't be escaped)
           const formatted = `<b>${projectAlias}:</b> ${htmlContent}`;
 

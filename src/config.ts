@@ -223,6 +223,53 @@ After starting a long-run process, tell the user it's running in background.
 When you receive a completion notification, read the log file and continue.
 
 Do NOT use long-run for quick commands (<30s) or interactive commands.
+
+
+FILE FORWARDING:
+When a user sends a file with a caption starting with "/raw", the file is saved
+directly to your working directory without any parsing or text extraction.
+
+You'll receive a message with:
+- Original filename
+- File path (relative to your working directory)
+- File size
+- User's note (caption without /raw prefix)
+
+Files are stored in: .claude-bot/files/
+
+You can read, process, or analyze these files using Bash or Read tools. Examples:
+- Read JSON: Use Read tool on the file path
+- Process CSV: Use Bash with awk, cut, or other CLI tools
+- Binary files: Use appropriate tools (xxd, file, etc.)
+
+LARGE RESPONSES:
+If your response exceeds 3500 characters, it will be automatically saved to
+.claude-bot/responses/ and sent to the user as a downloadable file. This
+prevents Telegram formatting errors and message fragmentation.
+
+
+FILE SENDING:
+You can send files back to the user via Telegram using a special marker syntax.
+To send a file, include this marker in your response:
+
+  [SEND_FILE: /path/to/file.ext]
+
+Examples:
+  - [SEND_FILE: /home/ubuntu/Projects/myproject/output.png] - Send an image
+  - [SEND_FILE: ./report.pdf] - Send a PDF (relative paths work)
+  - [SEND_FILE: /tmp/data.json] - Send any file type
+
+The file marker will be removed from your message and the file will be sent
+automatically. You can include multiple [SEND_FILE] markers to send multiple files.
+
+Supported file types: images (png, jpg, gif), documents (pdf, txt, csv, json),
+videos (mp4, webm), audio (mp3, ogg), and any other file type.
+
+IMPORTANT:
+- Always verify the file exists before requesting to send it
+- Use absolute paths or paths relative to the working directory
+- The file path will be validated against allowed directories for security
+- If the file doesn't exist or is outside allowed paths, an error will be shown
 `;
 
 /**
@@ -267,7 +314,7 @@ export const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || "";
 export const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Neural2-J";
 export const GOOGLE_TTS_LANGUAGE = process.env.GOOGLE_TTS_LANGUAGE || "en-US";
 export const TTS_AVAILABLE = GOOGLE_TTS_API_KEY.length > 0;
-export const TTS_MAX_CHARS = 800; // Truncate to keep audio under 5MB (Telegram limit)
+export const TTS_MAX_CHARS = 500; // Truncate to ~30-40 seconds of audio (keeps messages concise)
 
 // Voice-optimized system prompt addon
 export const VOICE_MODE_PROMPT = `
@@ -307,6 +354,60 @@ export const TELEGRAM_MESSAGE_LIMIT = 4096; // Max characters per message
 export const TELEGRAM_SAFE_LIMIT = 4000; // Safe limit with buffer for formatting
 export const STREAMING_THROTTLE_MS = 500; // Throttle streaming updates
 export const BUTTON_LABEL_MAX_LENGTH = 30; // Max chars for inline button labels
+
+// ============== File Forwarding Configuration ==============
+
+// Maximum file size for raw mode forwarding (default: 50MB)
+export const RAW_FILE_MAX_SIZE = parseInt(
+  process.env.RAW_FILE_MAX_SIZE || "52428800",
+  10
+);
+
+// Response size threshold for auto-saving (default: 3500 chars)
+// Telegram's limit is 4096, we use 3500 for safety buffer
+export const RESPONSE_SIZE_THRESHOLD = parseInt(
+  process.env.RESPONSE_SIZE_THRESHOLD || "3500",
+  10
+);
+
+// Enable auto-save of large responses
+export const AUTO_SAVE_LARGE_RESPONSES =
+  (process.env.AUTO_SAVE_LARGE_RESPONSES || "true").toLowerCase() === "true";
+
+// File retention period in days (default: 7 days)
+export const FILE_RETENTION_DAYS = parseInt(
+  process.env.FILE_RETENTION_DAYS || "7",
+  10
+);
+
+// Cleanup interval in milliseconds (default: 24 hours)
+export const CLEANUP_INTERVAL_MS = parseInt(
+  process.env.CLEANUP_INTERVAL_MS || String(24 * 60 * 60 * 1000),
+  10
+);
+
+// ============== Smart Table Rendering Configuration ==============
+
+// Enable smart three-tier table rendering
+export const ENABLE_SMART_TABLE_RENDERING =
+  (process.env.ENABLE_SMART_TABLE_RENDERING || "true").toLowerCase() !== "false";
+
+// Table rendering thresholds
+export const TABLE_RENDERING_THRESHOLDS = {
+  // Simple → list format if both conditions met
+  simpleMaxCols: parseInt(process.env.TABLE_SIMPLE_MAX_COLS || "3", 10),
+  simpleMaxRows: parseInt(process.env.TABLE_SIMPLE_MAX_ROWS || "3", 10),
+
+  // Large → image + CSV if either condition met
+  largeMinCols: parseInt(process.env.TABLE_LARGE_MIN_COLS || "10", 10),
+  largeMinRows: parseInt(process.env.TABLE_LARGE_MIN_ROWS || "20", 10),
+};
+
+// Maximum width for table images in pixels
+export const TABLE_IMAGE_MAX_WIDTH = parseInt(
+  process.env.TABLE_IMAGE_MAX_WIDTH || "800",
+  10
+);
 
 // ============== Audit Logging ==============
 

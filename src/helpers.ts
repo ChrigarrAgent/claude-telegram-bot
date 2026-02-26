@@ -120,7 +120,7 @@ export async function sendMessageWithRetry(
 ): Promise<SendMessageResult> {
   const projectAlias = getProjectAlias(projectSession.workingDir);
   let state = new StreamingState();
-  let statusCallback = createStatusCallback(ctx, state, projectAlias, voiceEnabled);
+  let statusCallback = createStatusCallback(ctx, state, projectAlias, voiceEnabled, projectSession.workingDir);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -156,7 +156,7 @@ export async function sendMessageWithRetry(
 
         // Reset state for retry
         state = new StreamingState();
-        statusCallback = createStatusCallback(ctx, state, projectAlias, voiceEnabled);
+        statusCallback = createStatusCallback(ctx, state, projectAlias, voiceEnabled, projectSession.workingDir);
         continue;
       }
 
